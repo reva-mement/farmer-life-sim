@@ -1,9 +1,9 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import { smoothstep, sampleType, SOIL } from "./terrain";
+import { smoothstep, sampleType, fbm, SOIL } from "./terrain";
 import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
-import { buildFarmhouseVoxel } from "./houseVoxel";
-import { buildFarmhouseVoxelWorn } from "./houseVoxelWorn";
+import { buildFarmhouseVoxelSmoothRoof } from "./houseVoxelSmoothRoof";
+import { buildFarmhouseVoxelWornSmoothRoof } from "./houseVoxelWornSmoothRoof";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -44,6 +44,26 @@ function paddyRowXs(centerX, nearSign) {
 }
 const PADDY_ROWS_LEFT = paddyRowXs(PADDY_PLACEMENTS[0].x, 1);
 const PADDY_ROWS_RIGHT = paddyRowXs(PADDY_PLACEMENTS[1].x, -1);
+
+// The two houses on the road-only tile north of the paddies - one side
+// well-kept, one weathered. rotY faces each house's door toward the road.
+const HOUSE_PLACEMENTS = [
+  { x: -3, z: GRID_SIZE, rotY: Math.PI / 2, worn: false },
+  { x: 3, z: GRID_SIZE, rotY: -Math.PI / 2, worn: true },
+];
+// Ground stays flat right under each house (it sits at a fixed y=0) instead
+// of following the new rolling-terrain displacement below - same idea as
+// paddyDepression, just flattening toward 0 instead of carving a basin.
+const HOUSE_FLATTEN_RADIUS = 1.5;
+const HOUSE_FLATTEN_WIDTH = 1.1;
+function houseFlatten(worldX, worldZ) {
+  let t = 0;
+  for (const h of HOUSE_PLACEMENTS) {
+    const dist = Math.hypot(worldX - h.x, worldZ - h.z);
+    t = Math.max(t, 1 - smoothstep(HOUSE_FLATTEN_RADIUS, HOUSE_FLATTEN_RADIUS + HOUSE_FLATTEN_WIDTH, dist));
+  }
+  return t;
+}
 
 // The scene's ground is one continuous mesh, so a paddy sitting "in" it
 // needs its own vertices pushed down first — otherwise the ground plane at
@@ -100,7 +120,19 @@ function groundSample(worldX, worldZ) {
     b += (PADDY_FRINGE_COLOR[2] - b) * fringe;
     rough -= fringe * 0.15; // damp soil is slightly glossier than dry soil
   }
-  return { r, g, b, height, bumpHeight, rough };
+  return { r, g, b, height, bumpHeight, rough, pathT: t };
+}
+
+// Broad, low-frequency rolling undulation for the ground - separate from
+// the fine clump/grain/pebble noise in terrain.js's sampleType, which is
+// too small-wavelength (and too tied to the soil/path color blend) to read
+// as real terrain shape on its own. Suppressed over the road itself (packed
+// dirt stays flatter than the surrounding field) via the caller's pathT.
+const TERRAIN_ROLL_SCALE = 0.16; // lower = broader hills
+const TERRAIN_ROLL_AMP = 0.16; // world units
+function terrainRoll(worldX, worldZ, pathT) {
+  const n = fbm(worldX * TERRAIN_ROLL_SCALE, worldZ * TERRAIN_ROLL_SCALE, 4);
+  return (n - 0.5) * 2 * TERRAIN_ROLL_AMP * (1 - pathT * 0.85);
 }
 function buildGroundTextures(texW, texH, worldW, worldD, zCenter) {
   const colorCanvas = document.createElement("canvas");
@@ -161,8 +193,11 @@ function buildGround(worldD, zCenter) {
     // started describing two different physical locations.
     const worldZ = -pos.getY(i) + zCenter;
     const s = groundSample(worldX, worldZ);
+    const roll = terrainRoll(worldX, worldZ, s.pathT);
+    const flatten = houseFlatten(worldX, worldZ);
+    const rolled = (s.height + roll) * (1 - flatten);
     const depress = paddyDepression(worldX, worldZ);
-    const finalHeight = s.height * (1 - depress) + PADDY_DEPRESS_Y * depress;
+    const finalHeight = rolled * (1 - depress) + PADDY_DEPRESS_Y * depress;
     pos.setZ(i, finalHeight);
   }
   geo.computeVertexNormals();
@@ -727,17 +762,14 @@ export default function VillagePathWalkScene() {
     const ground = buildGround(worldD, groundZCenter);
     scene.add(ground);
 
-    const farmhouse = buildFarmhouseVoxel();
-    farmhouse.position.set(-3, 0, GRID_SIZE); // one side of the new tile, clear of the road
-    farmhouse.rotation.y = Math.PI / 2; // face the road
-    scene.add(farmhouse);
-
-    // A second, weathered household on the opposite side of the road -
-    // not every farmer's house is kept up the same.
-    const farmhouseWorn = buildFarmhouseVoxelWorn();
-    farmhouseWorn.position.set(3, 0, GRID_SIZE);
-    farmhouseWorn.rotation.y = -Math.PI / 2; // face the road
-    scene.add(farmhouseWorn);
+    // The two houses on the road tile - one well-kept, one weathered (see
+    // HOUSE_PLACEMENTS). Voxel body + smooth, bump-mapped thatch roof.
+    for (const h of HOUSE_PLACEMENTS) {
+      const house = h.worn ? buildFarmhouseVoxelWornSmoothRoof() : buildFarmhouseVoxelSmoothRoof();
+      house.position.set(h.x, 0, h.z);
+      house.rotation.y = h.rotY;
+      scene.add(house);
+    }
 
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).

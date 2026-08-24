@@ -2,12 +2,12 @@ import * as THREE from "three";
 
 // A voxel / "dot art" (ドット絵) rendering of the same Sengoku-era farmhouse
 // modeled in house.js - a stylized, blocky low-res reinterpretation built
-// from small cubes instead of sculpted mesh surfaces. Standalone: not wired
-// into the main scene, so it has zero effect on what's deployed. Keeps the
-// same iconography as the mesh version (kirizuma gable roof tapering to a
-// ridge, exposed corner/mid posts, a darker mud splash-guard band low on
-// the walls, a plank door, a small window, a stone plinth) so the two are
-// a fair side-by-side comparison of art style rather than of research.
+// from small cubes instead of sculpted mesh surfaces. This is the farmhouse
+// used in the scene (see VillagePathWalkScene.jsx); house.js's mesh version
+// is kept around as the earlier alternative it replaced. Keeps the same
+// iconography as the mesh version (kirizuma gable roof tapering to a ridge,
+// exposed corner/mid posts, a darker mud splash-guard band low on the
+// walls, a plank door, a small window, a stone plinth) researched there.
 
 // GRANULARITY scales the voxel grid up while holding the house's real-world
 // size fixed - each voxel gets 1/GRANULARITY as large, so features defined
@@ -148,12 +148,8 @@ export function buildFarmhouseVoxel() {
   const geo = new THREE.BoxGeometry(S * 0.92, S * 0.92, S * 0.92);
   const mat = new THREE.MeshStandardMaterial({ roughness: 0.9 });
   const mesh = new THREE.InstancedMesh(geo, mat, voxels.length);
-  // Shadow casting/receiving off: at this instance count (tens of thousands
-  // of tiny cubes) the shadow-map depth pass is what makes this prototype
-  // crawl under headless Chromium's software (SwiftShader) WebGL renderer -
-  // confirmed by profiling, not guessed. Not needed to judge the art style.
-  mesh.castShadow = false;
-  mesh.receiveShadow = false;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
 
   const centerIx = (NX - 1) / 2;
   const centerIz = (NZ - 1) / 2;

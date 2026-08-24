@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { smoothstep, sampleType, SOIL } from "./terrain";
 import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
-import { buildFarmhouse } from "./house";
+import { buildFarmhouseVoxel } from "./houseVoxel";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -726,7 +726,7 @@ export default function VillagePathWalkScene() {
     const ground = buildGround(worldD, groundZCenter);
     scene.add(ground);
 
-    const farmhouse = buildFarmhouse();
+    const farmhouse = buildFarmhouseVoxel();
     farmhouse.position.set(-3, 0, GRID_SIZE); // one side of the new tile, clear of the road
     farmhouse.rotation.y = Math.PI / 2; // face the road
     scene.add(farmhouse);

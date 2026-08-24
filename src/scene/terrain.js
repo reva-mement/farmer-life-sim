@@ -44,7 +44,7 @@ export function smoothstep(edge0, edge1, x) {
 export const SOIL = {
   clumpScale: 5.5, grainScale: 18, pebbleScale: 30,
   dispClump: 0.024, dispGrain: 0.005, dispPebble: 0.014,
-  colorLow: [134, 109, 82], colorHigh: [181, 148, 109],
+  colorLow: [124, 76, 54], colorHigh: [178, 108, 72], // shifted toward red clay (akatsuchi)
   speckAmt: 26, pebbleShadeAmt: 14, roughLow: 0.6, roughHigh: 0.95,
 };
 

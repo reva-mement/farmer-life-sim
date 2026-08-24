@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
+import { smoothstep, sampleType, SOIL } from "./terrain";
+import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER } from "./paddy";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -7,54 +9,12 @@ import * as THREE from "three";
 // Logic is carried over as-is; only the outer demo-page chrome (title,
 // Google Fonts import, fixed-size card layout) is dropped in favor of a
 // full-bleed mount, matching how the rest of the app's scenes are hosted.
+// The noise/soil-sampling helpers moved to terrain.js once paddy.js needed
+// the identical code; the road-blending config below stays local since it's
+// specific to this ground.
 
 const GRID_SIZE = 11;
 
-// ---------- value noise (fbm) — ground ----------
-function hash(x, y) {
-  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
-  return s - Math.floor(s);
-}
-function smooth(t) {
-  return t * t * (3 - 2 * t);
-}
-function noise2D(x, y) {
-  const xi = Math.floor(x);
-  const yi = Math.floor(y);
-  const xf = x - xi;
-  const yf = y - yi;
-  const u = smooth(xf);
-  const v = smooth(yf);
-  const a = hash(xi, yi);
-  const b = hash(xi + 1, yi);
-  const c = hash(xi, yi + 1);
-  const d = hash(xi + 1, yi + 1);
-  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
-}
-function fbm(x, y, octaves = 4) {
-  let total = 0;
-  let amp = 0.5;
-  let freq = 1;
-  let max = 0;
-  for (let i = 0; i < octaves; i++) {
-    total += noise2D(x * freq, y * freq) * amp;
-    max += amp;
-    amp *= 0.5;
-    freq *= 2;
-  }
-  return total / max;
-}
-function smoothstep(edge0, edge1, x) {
-  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
-  return t * t * (3 - 2 * t);
-}
-
-const SOIL = {
-  clumpScale: 5.5, grainScale: 18, pebbleScale: 30,
-  dispClump: 0.024, dispGrain: 0.005, dispPebble: 0.014,
-  colorLow: [134, 109, 82], colorHigh: [181, 148, 109],
-  speckAmt: 26, pebbleShadeAmt: 14, roughLow: 0.6, roughHigh: 0.95,
-};
 const PATH = {
   clumpScale: 7, grainScale: 22, pebbleScale: 36,
   dispClump: 0.01, dispGrain: 0.003, dispPebble: 0.007,
@@ -65,22 +25,32 @@ const PATH_CENTER_X = 0;
 const PATH_HALF_WIDTH = 0.6; // doubled from the reference study's 0.3
 const PATH_EDGE_SOFT = 0.3;
 
-function sampleType(cfg, u, v) {
-  const clump = fbm(u * cfg.clumpScale, v * cfg.clumpScale, 4);
-  const grain = fbm(u * cfg.grainScale + 40, v * cfg.grainScale + 40, 2);
-  const pebble = fbm(u * cfg.pebbleScale + 80, v * cfg.pebbleScale + 80, 2);
-  let r = cfg.colorLow[0] + (cfg.colorHigh[0] - cfg.colorLow[0]) * clump;
-  let g = cfg.colorLow[1] + (cfg.colorHigh[1] - cfg.colorLow[1]) * clump;
-  let b = cfg.colorLow[2] + (cfg.colorHigh[2] - cfg.colorLow[2]) * clump;
-  const speck = (grain - 0.5) * cfg.speckAmt;
-  r += speck; g += speck * 0.9; b += speck * 0.75;
-  const pebbleShade = (pebble - 0.5) * cfg.pebbleShadeAmt;
-  r += pebbleShade; g += pebbleShade * 0.9; b += pebbleShade * 0.8;
-  const height = clump * cfg.dispClump + grain * cfg.dispGrain + pebble * cfg.dispPebble;
-  const bumpHeight = clump * 0.5 + grain * 0.25 + pebble * 0.4;
-  const rough = cfg.roughHigh - clump * (cfg.roughHigh - cfg.roughLow) - (grain - 0.5) * 0.08;
-  return { r, g, b, height, bumpHeight, rough };
+// Paddies flank the path, clear of both its soft edge (|x| < 0.9) and the
+// ground bounds (|x| < 5.5).
+const PADDY_PLACEMENTS = [
+  { x: -2.8, z: 0 },
+  { x: 2.8, z: 0 },
+];
+const PADDY_DEPRESS_Y = -0.2; // well below the paddy floor, so it's fully hidden once carved
+
+// The scene's ground is one continuous mesh, so a paddy sitting "in" it
+// needs its own vertices pushed down first — otherwise the ground plane at
+// y~0 just covers the basin (floor/water/rice) sitting below it. The
+// transition is sized to exactly the bank ring width, so it's hidden under
+// the paddy's levee bank mesh.
+function paddyDepression(worldX, worldZ) {
+  const innerHalfW = PADDY_W / 2;
+  const innerHalfD = PADDY_D / 2;
+  let t = 0;
+  for (const p of PADDY_PLACEMENTS) {
+    const ax = Math.max(0, Math.abs(worldX - p.x) - innerHalfW);
+    const az = Math.max(0, Math.abs(worldZ - p.z) - innerHalfD);
+    const dist = Math.hypot(ax, az);
+    t = Math.max(t, 1 - smoothstep(0, PADDY_BANK_OUTER, dist));
+  }
+  return t;
 }
+
 function groundSample(worldX, worldZ) {
   const soil = sampleType(SOIL, worldX, worldZ);
   const path = sampleType(PATH, worldX, worldZ);
@@ -145,7 +115,8 @@ function buildGround() {
     const worldX = pos.getX(i);
     const worldZ = pos.getY(i);
     const s = groundSample(worldX, worldZ);
-    pos.setZ(i, s.height);
+    const depress = paddyDepression(worldX, worldZ);
+    pos.setZ(i, s.height * (1 - depress) + PADDY_DEPRESS_Y * depress);
   }
   geo.computeVertexNormals();
   geo.rotateX(-Math.PI / 2);
@@ -493,7 +464,7 @@ function createWalker({ farmer, joints, laneX, walkZFrom, walkZTo, walkDuration,
   };
 }
 
-const MIN_ZOOM = 0.6;
+const MIN_ZOOM = 0.12; // pinched all the way out still fits the whole 11x11 field, even on a narrow phone
 const MAX_ZOOM = 3.2;
 
 export default function VillagePathWalkScene() {
@@ -547,6 +518,15 @@ export default function VillagePathWalkScene() {
     const ground = buildGround();
     scene.add(ground);
 
+    // Rice paddies flanking the path, one on each side, clear of both the
+    // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 5.5).
+    const paddies = PADDY_PLACEMENTS.map(({ x, z }) => {
+      const paddy = buildPaddy();
+      paddy.root.position.set(x, 0, z);
+      scene.add(paddy.root);
+      return paddy;
+    });
+
     // Two farmers, each in their own lane offset from the path center so
     // they can never collide even when crossing at the same z. Slightly
     // different pacing keeps them from looking robotically synced.
@@ -588,6 +568,12 @@ export default function VillagePathWalkScene() {
       const t = clock.getElapsedTime();
       walkerA.update(t, dt);
       walkerB.update(t, dt);
+      const ox = Math.sin(t * 0.2) * 0.05;
+      const oy = Math.cos(t * 0.16) * 0.05;
+      for (const { water } of paddies) {
+        if (water.material.map) water.material.map.offset.set(ox, oy);
+        if (water.material.bumpMap) water.material.bumpMap.offset.set(ox * 1.3, oy * 1.3);
+      }
       renderer.render(scene, camera);
     }
     renderer.setAnimationLoop(animate);

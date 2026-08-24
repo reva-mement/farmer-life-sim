@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { smoothstep, sampleType, SOIL } from "./terrain";
 import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
+import { buildFarmhouse } from "./house";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -100,7 +101,7 @@ function groundSample(worldX, worldZ) {
   }
   return { r, g, b, height, bumpHeight, rough };
 }
-function buildGroundTextures(texW, texH, worldW, worldD) {
+function buildGroundTextures(texW, texH, worldW, worldD, zCenter) {
   const colorCanvas = document.createElement("canvas");
   colorCanvas.width = texW; colorCanvas.height = texH;
   const cctx = colorCanvas.getContext("2d");
@@ -114,7 +115,7 @@ function buildGroundTextures(texW, texH, worldW, worldD) {
   const bimg = bctx.createImageData(texW, texH);
   const rimg = rctx.createImageData(texW, texH);
   for (let py = 0; py < texH; py++) {
-    const worldZ = (py / texH) * worldD - worldD / 2;
+    const worldZ = (py / texH) * worldD - worldD / 2 + zCenter;
     for (let px = 0; px < texW; px++) {
       const worldX = (px / texW) * worldW - worldW / 2;
       const s = groundSample(worldX, worldZ);
@@ -140,30 +141,45 @@ function buildGroundTextures(texW, texH, worldW, worldD) {
   const roughTex = new THREE.CanvasTexture(roughCanvas);
   return { colorTex, bumpTex, roughTex };
 }
-function buildGround() {
+// zCenter offsets the whole plane along world Z, so a second tile can be
+// appended north of the original (still centered at z=0) without moving
+// anything already placed there (paddies, the farmer's walk range, etc).
+function buildGround(worldD, zCenter) {
   const worldW = GRID_SIZE;
-  const worldD = GRID_SIZE;
   const segs = 88;
   const geo = new THREE.PlaneGeometry(worldW, worldD, segs, segs);
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
     const worldX = pos.getX(i);
-    const worldZ = pos.getY(i);
+    // geo.rotateX(-PI/2) below maps local Y -> world Z *negated* (verified
+    // empirically: a vertex at local Y=-1 ends up at Z=+1). buildGroundTextures'
+    // py-based sampling already accounts for this; this loop needs the same
+    // sign or the two fall out of sync — invisible while the ground was
+    // Z-symmetric (paddies sat exactly on the mirror axis), but once a
+    // second tile made it asymmetric, vertex heights and texture colors
+    // started describing two different physical locations.
+    const worldZ = -pos.getY(i) + zCenter;
     const s = groundSample(worldX, worldZ);
     const depress = paddyDepression(worldX, worldZ);
-    pos.setZ(i, s.height * (1 - depress) + PADDY_DEPRESS_Y * depress);
+    const finalHeight = s.height * (1 - depress) + PADDY_DEPRESS_Y * depress;
+    pos.setZ(i, finalHeight);
   }
   geo.computeVertexNormals();
   geo.rotateX(-Math.PI / 2);
-  const texPerUnit = 130;
+  // Lower than the original tile's 130: the ground is now 2x the area
+  // (a second, road-only tile appended), and generating the color/bump/
+  // rough canvases is a synchronous per-pixel JS loop — at 130 the total
+  // pixel count made the page hang for ~10s on load.
+  const texPerUnit = 75;
   const { colorTex, bumpTex, roughTex } = buildGroundTextures(
-    Math.round(worldW * texPerUnit), Math.round(worldD * texPerUnit), worldW, worldD
+    Math.round(worldW * texPerUnit), Math.round(worldD * texPerUnit), worldW, worldD, zCenter
   );
   const mat = new THREE.MeshStandardMaterial({
     map: colorTex, bumpMap: bumpTex, bumpScale: 0.015,
     roughnessMap: roughTex, roughness: 1, metalness: 0.02,
   });
   const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.z = zCenter;
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   return mesh;
@@ -663,7 +679,9 @@ export default function VillagePathWalkScene() {
     const panRight = new THREE.Vector3(basisRight.x, 0, basisRight.z).normalize();
     const panFwd = new THREE.Vector3(basisUp.x, 0, basisUp.z).normalize(); // ground projection of "screen up"
     const panOffset = new THREE.Vector3(0, 0, 0);
-    const PAN_LIMIT = GRID_SIZE / 2 + 1;
+    const PAN_LIMIT_X = GRID_SIZE / 2 + 1;
+    const PAN_Z_MIN = -(GRID_SIZE / 2 + 1);
+    const PAN_Z_MAX = GRID_SIZE + GRID_SIZE / 2 + 1; // the road-only tile appended to the north
     function applyCameraTransform() {
       camera.position.copy(CAM_BASE_POS).add(panOffset);
       camera.lookAt(CAM_BASE_TARGET.clone().add(panOffset));
@@ -699,11 +717,22 @@ export default function VillagePathWalkScene() {
     const fill = new THREE.AmbientLight(0x7d8caa, 0.18);
     scene.add(fill);
 
-    const ground = buildGround();
+    // The original tile (paddies, farmer walk range) stays at z in
+    // [-GRID_SIZE/2, GRID_SIZE/2]; a second, road-only tile of the same
+    // size is appended north of it, extending the same continuous ground
+    // (the road/soil blend is Z-independent, so it just keeps going).
+    const worldD = GRID_SIZE * 2;
+    const groundZCenter = GRID_SIZE / 2;
+    const ground = buildGround(worldD, groundZCenter);
     scene.add(ground);
 
+    const farmhouse = buildFarmhouse();
+    farmhouse.position.set(-3, 0, GRID_SIZE); // one side of the new tile, clear of the road
+    farmhouse.rotation.y = Math.PI / 2; // face the road
+    scene.add(farmhouse);
+
     // Rice paddies flanking the path, one on each side, clear of both the
-    // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 5.5).
+    // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).
     const paddies = PADDY_PLACEMENTS.map(({ x, z }) => {
       const paddy = buildPaddy();
       paddy.root.position.set(x, 0, z);
@@ -819,8 +848,8 @@ export default function VillagePathWalkScene() {
         const delta = panRight.clone().multiplyScalar(-dxPixels * worldPerPixelY)
           .add(panFwd.clone().multiplyScalar(dyPixels * worldPerPixelY));
         panOffset.add(delta);
-        panOffset.x = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, panOffset.x));
-        panOffset.z = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, panOffset.z));
+        panOffset.x = Math.max(-PAN_LIMIT_X, Math.min(PAN_LIMIT_X, panOffset.x));
+        panOffset.z = Math.max(PAN_Z_MIN, Math.min(PAN_Z_MAX, panOffset.z));
         applyCameraTransform();
       }
     }

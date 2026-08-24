@@ -260,8 +260,9 @@ export function buildPaddy() {
   const marginX = 0.14, marginZ = 0.12;
   const usableW = paddyW - marginX * 2;
   const usableD = paddyD - marginZ * 2;
-  for (let iz = 0; iz < rows; iz++) {
-    for (let ix = 0; ix < cols; ix++) {
+  // skip the outermost ring so rice doesn't grow right up against the bank
+  for (let iz = 1; iz < rows - 1; iz++) {
+    for (let ix = 1; ix < cols - 1; ix++) {
       const x = -paddyW / 2 + marginX + (usableW * ix) / (cols - 1) + (Math.random() - 0.5) * 0.02;
       const z = -paddyD / 2 + marginZ + (usableD * iz) / (rows - 1) + (Math.random() - 0.5) * 0.02;
       const hill = buildRiceHill(bladeGeo);

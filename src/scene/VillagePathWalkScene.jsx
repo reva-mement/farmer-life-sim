@@ -2,8 +2,8 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { smoothstep, sampleType, fbm, SOIL } from "./terrain";
 import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
-import { buildFarmhouseVoxelSmoothRoof } from "./houseVoxelSmoothRoof";
-import { buildFarmhouseVoxelWornSmoothRoof } from "./houseVoxelWornSmoothRoof";
+import { buildFarmhouseVoxel } from "./houseVoxel";
+import { buildFarmhouseVoxelWorn } from "./houseVoxelWorn";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -763,9 +763,12 @@ export default function VillagePathWalkScene() {
     scene.add(ground);
 
     // The two houses on the road tile - one well-kept, one weathered (see
-    // HOUSE_PLACEMENTS). Voxel body + smooth, bump-mapped thatch roof.
+    // HOUSE_PLACEMENTS). Fully voxel/dot-art - the ragged eave + weathering
+    // noise on the worn house does enough to hide the cube grid that the
+    // smooth-mesh roof (houseVoxelSmoothRoof.js/houseVoxelWornSmoothRoof.js)
+    // wasn't worth the extra complexity at normal viewing distance.
     for (const h of HOUSE_PLACEMENTS) {
-      const house = h.worn ? buildFarmhouseVoxelWornSmoothRoof() : buildFarmhouseVoxelSmoothRoof();
+      const house = h.worn ? buildFarmhouseVoxelWorn() : buildFarmhouseVoxel();
       house.position.set(h.x, 0, h.z);
       house.rotation.y = h.rotY;
       scene.add(house);

@@ -19,7 +19,9 @@ const extraWaitMs = waitArg ? Number(waitArg.split("=")[1]) : 600;
 const outPath = args.find((a) => !a.startsWith("--")) ?? path.join(root, "screenshots", "latest.png");
 
 const PORT = 5183;
-const URL = `http://localhost:${PORT}`;
+// Must match vite.config.js `base` — the dev server serves the app under
+// that path too, matching production (GitHub Pages) behavior.
+const URL = `http://localhost:${PORT}/farmer-life-sim/`;
 const CHROMIUM_PATH = "/opt/pw-browsers/chromium";
 
 function waitForServer(url, timeoutMs) {

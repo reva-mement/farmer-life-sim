@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { smoothstep, sampleType, SOIL } from "./terrain";
-import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER } from "./paddy";
+import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -32,13 +32,16 @@ const PADDY_PLACEMENTS = [
   { x: 3.6, z: 0 },
 ];
 const PADDY_DEPRESS_Y = -0.2; // well below the paddy floor, so it's fully hidden once carved
-// each lane's walker treats its paddy as two rows: a near one (closer to
-// the path) and a far one (deeper in), each a quarter of the paddy's width
-// in from center so both stay clear of the levee banks
-const PADDY_ROW_X_LEFT_NEAR = PADDY_PLACEMENTS[0].x + PADDY_W / 2 * 0.5;
-const PADDY_ROW_X_LEFT_FAR = PADDY_PLACEMENTS[0].x - PADDY_W / 2 * 0.5;
-const PADDY_ROW_X_RIGHT_NEAR = PADDY_PLACEMENTS[1].x - PADDY_W / 2 * 0.5;
-const PADDY_ROW_X_RIGHT_FAR = PADDY_PLACEMENTS[1].x + PADDY_W / 2 * 0.5;
+// each lane's walker plants 4 rows across its paddy's width, evenly spaced
+// and clear of the levee banks — ordered near-to-path first
+const PADDY_ROW_FRACTIONS = [0.75, 0.25, -0.25, -0.75]; // x (fraction of half-width) offsets from center
+function paddyRowXs(centerX, nearSign) {
+  // nearSign points the first (near) row toward the path, whichever side
+  // this paddy is on
+  return PADDY_ROW_FRACTIONS.map((f) => centerX + nearSign * f * (PADDY_W / 2));
+}
+const PADDY_ROWS_LEFT = paddyRowXs(PADDY_PLACEMENTS[0].x, 1);
+const PADDY_ROWS_RIGHT = paddyRowXs(PADDY_PLACEMENTS[1].x, -1);
 
 // The scene's ground is one continuous mesh, so a paddy sitting "in" it
 // needs its own vertices pushed down first — otherwise the ground plane at
@@ -58,19 +61,44 @@ function paddyDepression(worldX, worldZ) {
   return t;
 }
 
+// How close a ground point is to a paddy's outer (bank) edge, 0 far away to
+// 1 right at the bank — used to fade the surrounding soil's color toward
+// damp mud as it nears the paddy, instead of jumping straight from dry red
+// soil to the bank's wet color right at that edge.
+const PADDY_FRINGE_WIDTH = 0.9;
+function paddyProximity(worldX, worldZ) {
+  const outerHalfW = PADDY_W / 2 + PADDY_BANK_OUTER;
+  const outerHalfD = PADDY_D / 2 + PADDY_BANK_OUTER;
+  let t = 0;
+  for (const p of PADDY_PLACEMENTS) {
+    const ax = Math.max(0, Math.abs(worldX - p.x) - outerHalfW);
+    const az = Math.max(0, Math.abs(worldZ - p.z) - outerHalfD);
+    const dist = Math.hypot(ax, az);
+    t = Math.max(t, 1 - smoothstep(0, PADDY_FRINGE_WIDTH, dist));
+  }
+  return t;
+}
+
 function groundSample(worldX, worldZ) {
   const soil = sampleType(SOIL, worldX, worldZ);
   const path = sampleType(PATH, worldX, worldZ);
   const dist = Math.abs(worldX - PATH_CENTER_X);
   const t = 1 - smoothstep(PATH_HALF_WIDTH, PATH_HALF_WIDTH + PATH_EDGE_SOFT, dist);
-  return {
-    r: soil.r + (path.r - soil.r) * t,
-    g: soil.g + (path.g - soil.g) * t,
-    b: soil.b + (path.b - soil.b) * t,
-    height: soil.height + (path.height - soil.height) * t,
-    bumpHeight: soil.bumpHeight + (path.bumpHeight - soil.bumpHeight) * t,
-    rough: soil.rough + (path.rough - soil.rough) * t,
-  };
+  let r = soil.r + (path.r - soil.r) * t;
+  let g = soil.g + (path.g - soil.g) * t;
+  let b = soil.b + (path.b - soil.b) * t;
+  let rough = soil.rough + (path.rough - soil.rough) * t;
+  const height = soil.height + (path.height - soil.height) * t;
+  const bumpHeight = soil.bumpHeight + (path.bumpHeight - soil.bumpHeight) * t;
+
+  const fringe = paddyProximity(worldX, worldZ);
+  if (fringe > 0) {
+    r += (PADDY_FRINGE_COLOR[0] - r) * fringe;
+    g += (PADDY_FRINGE_COLOR[1] - g) * fringe;
+    b += (PADDY_FRINGE_COLOR[2] - b) * fringe;
+    rough -= fringe * 0.15; // damp soil is slightly glossier than dry soil
+  }
+  return { r, g, b, height, bumpHeight, rough };
 }
 function buildGroundTextures(texW, texH, worldW, worldD) {
   const colorCanvas = document.createElement("canvas");
@@ -383,14 +411,15 @@ function buildFarmerRigged() {
 // instances can share the logic while walking their own lane (laneX) with
 // their own timing, instead of colliding on a single shared position.
 //
-// If paddyNearX/paddyFarX are given, the walker treats the paddy as two
-// rows (near the path edge, and deeper in): every time it crosses paddyZ
-// on the path, it detours in, plants its way forward through the near row
-// (step, bow, step, bow, ... x4), turns back, shifts into the far row and
-// plants its way back through that one, then returns to its lane.
+// If paddyRows is given (ordered near-path-edge to deepest-in), the walker
+// treats the paddy as that many rows: every time it crosses paddyZ on the
+// path, it detours in and works each row in turn — step, bow, step, bow,
+// ... x plantCycles — reversing direction and shifting sideways into the
+// next row each time (a boustrophedon, like plowing a field), then returns
+// to its lane after the last row.
 function createWalker({
   farmer, joints, laneX, walkZFrom, walkZTo, walkDuration, stepFreq, turnDuration, startDir,
-  paddyNearX = null, paddyFarX = null, paddyZ = 0, strafeSpeed = 0.45,
+  paddyRows = null, paddyZ = 0, strafeSpeed = 0.45,
   plantCycles = 8, plantCycleDuration = 2.2, rowStep = 0.18, rowStepDuration = 0.6, // 8 = 4 doubled, matching the paddy's doubled row length
 }) {
   const legSwing = 0.25;
@@ -410,16 +439,16 @@ function createWalker({
 
   // facing while off the path: pick whichever way actually points at the
   // paddy, since sideways motion isn't driven by dir the way path walking is
-  const paddyFacingY = paddyNearX !== null && paddyNearX > laneX ? -Math.PI / 2 : Math.PI / 2;
+  const paddyFacingY = paddyRows !== null && paddyRows[0] > laneX ? -Math.PI / 2 : Math.PI / 2;
   let strafeStart = 0;
   let strafeFromX = laneX;
   let strafeToX = laneX;
   let strafeZ = paddyZ;
 
   // row-planting bookkeeping
-  let rowIndex = 0; // 0 = near row, 1 = far row
+  let rowIndex = 0;
   let rowDir = 1; // z direction walked while stepping through the current row
-  let rowX = paddyNearX;
+  let rowX = paddyRows ? paddyRows[0] : null;
   let rowZ = paddyZ;
   let cycleIndex = 0;
   let phaseStart = 0; // start time of the current rowStep/rowPlant sub-phase
@@ -474,7 +503,7 @@ function createWalker({
           turnFromY = farmer.rotation.y;
           turnToY = dir > 0 ? 0 : Math.PI; // faces the opposite way once turned
           turnJointsAtStart = jointRotations(phase);
-        } else if (paddyNearX !== null && (prevZ - paddyZ) * (z - paddyZ) < 0) {
+        } else if (paddyRows !== null && (prevZ - paddyZ) * (z - paddyZ) < 0) {
           // crossed paddyZ this frame — detour into the paddy
           z = paddyZ;
           farmer.position.set(laneX, 0, z);
@@ -482,7 +511,7 @@ function createWalker({
           state = "toPaddy";
           strafeStart = t;
           strafeFromX = laneX;
-          strafeToX = paddyNearX;
+          strafeToX = paddyRows[0];
           strafeZ = paddyZ;
         }
       } else if (state === "toPaddy" || state === "rowShift" || state === "fromPaddy") {
@@ -503,15 +532,15 @@ function createWalker({
           if (state === "toPaddy") {
             rowIndex = 0;
             rowDir = 1;
-            rowX = paddyNearX;
+            rowX = paddyRows[0];
             rowZ = strafeZ;
             cycleIndex = 0;
             phaseStart = t;
             state = "rowStep";
           } else if (state === "rowShift") {
-            rowIndex = 1;
-            rowDir = -1;
-            rowX = paddyFarX;
+            rowIndex += 1;
+            rowDir = -rowDir;
+            rowX = paddyRows[rowIndex];
             rowZ = strafeZ;
             cycleIndex = 0;
             phaseStart = t;
@@ -556,16 +585,16 @@ function createWalker({
           if (cycleIndex < plantCycles) {
             phaseStart = t;
             state = "rowStep";
-          } else if (rowIndex === 0) {
+          } else if (rowIndex < paddyRows.length - 1) {
             state = "rowShift";
             strafeStart = t;
-            strafeFromX = paddyNearX;
-            strafeToX = paddyFarX;
+            strafeFromX = paddyRows[rowIndex];
+            strafeToX = paddyRows[rowIndex + 1];
             strafeZ = rowZ;
           } else {
             state = "fromPaddy";
             strafeStart = t;
-            strafeFromX = paddyFarX;
+            strafeFromX = paddyRows[rowIndex];
             strafeToX = laneX;
             strafeZ = rowZ;
           }
@@ -680,8 +709,7 @@ export default function VillagePathWalkScene() {
       stepFreq: 0.7,
       turnDuration: 0.9,
       startDir: 1,
-      paddyNearX: PADDY_ROW_X_LEFT_NEAR,
-      paddyFarX: PADDY_ROW_X_LEFT_FAR,
+      paddyRows: PADDY_ROWS_LEFT,
     });
 
     const farmerB = buildFarmerRigged();
@@ -696,8 +724,7 @@ export default function VillagePathWalkScene() {
       stepFreq: 0.85,
       turnDuration: 0.9,
       startDir: -1,
-      paddyNearX: PADDY_ROW_X_RIGHT_NEAR,
-      paddyFarX: PADDY_ROW_X_RIGHT_FAR,
+      paddyRows: PADDY_ROWS_RIGHT,
     });
 
     const clock = new THREE.Clock();

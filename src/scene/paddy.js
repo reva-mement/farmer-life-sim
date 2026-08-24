@@ -20,6 +20,9 @@ const MUCK = {
   colorLow: [46, 40, 32], colorHigh: [77, 63, 46],
   speckAmt: 12, pebbleShadeAmt: 10, roughLow: 0.55, roughHigh: 0.85,
 };
+// MUCK's rough average — the color the surrounding ground fades toward as
+// it approaches the paddy, so dry soil meets wet mud gradually
+export const PADDY_FRINGE_COLOR = [61, 51, 39];
 
 function buildSoilTextures(cfg, w, d, x, z) {
   const texW = Math.max(64, Math.round(w * 130));

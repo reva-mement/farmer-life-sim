@@ -32,10 +32,13 @@ const PADDY_PLACEMENTS = [
   { x: 2.8, z: 0 },
 ];
 const PADDY_DEPRESS_Y = -0.2; // well below the paddy floor, so it's fully hidden once carved
-// where each lane's walker steps into its own paddy to plant — partway
-// in from the near edge, not all the way to the center
-const PADDY_ENTRY_X_LEFT = PADDY_PLACEMENTS[0].x + PADDY_W / 2 * 0.5;
-const PADDY_ENTRY_X_RIGHT = PADDY_PLACEMENTS[1].x - PADDY_W / 2 * 0.5;
+// each lane's walker treats its paddy as two rows: a near one (closer to
+// the path) and a far one (deeper in), each a quarter of the paddy's width
+// in from center so both stay clear of the levee banks
+const PADDY_ROW_X_LEFT_NEAR = PADDY_PLACEMENTS[0].x + PADDY_W / 2 * 0.5;
+const PADDY_ROW_X_LEFT_FAR = PADDY_PLACEMENTS[0].x - PADDY_W / 2 * 0.5;
+const PADDY_ROW_X_RIGHT_NEAR = PADDY_PLACEMENTS[1].x - PADDY_W / 2 * 0.5;
+const PADDY_ROW_X_RIGHT_FAR = PADDY_PLACEMENTS[1].x + PADDY_W / 2 * 0.5;
 
 // The scene's ground is one continuous mesh, so a paddy sitting "in" it
 // needs its own vertices pushed down first — otherwise the ground plane at
@@ -379,11 +382,16 @@ function buildFarmerRigged() {
 // Encapsulates one farmer's walk-the-path state machine so multiple
 // instances can share the logic while walking their own lane (laneX) with
 // their own timing, instead of colliding on a single shared position.
-// If paddyX is given, the walker detours into the paddy and plants rice
-// every time it passes paddyZ, then returns to its lane and continues.
+//
+// If paddyNearX/paddyFarX are given, the walker treats the paddy as two
+// rows (near the path edge, and deeper in): every time it crosses paddyZ
+// on the path, it detours in, plants its way forward through the near row
+// (step, bow, step, bow, ... x4), turns back, shifts into the far row and
+// plants its way back through that one, then returns to its lane.
 function createWalker({
   farmer, joints, laneX, walkZFrom, walkZTo, walkDuration, stepFreq, turnDuration, startDir,
-  paddyX = null, paddyZ = 0, strafeSpeed = 0.45, plantCycles = 4, plantCycleDuration = 1.1,
+  paddyNearX = null, paddyFarX = null, paddyZ = 0, strafeSpeed = 0.45,
+  plantCycles = 4, plantCycleDuration = 2.2, rowStep = 0.18, rowStepDuration = 0.6,
 }) {
   const legSwing = 0.25;
   const kneeBend = 0.9;
@@ -393,7 +401,7 @@ function createWalker({
   let dir = startDir;
   let z = startDir > 0 ? walkZFrom : walkZTo;
   let prevZ = z;
-  // "walking" | "turning" | "toPaddy" | "planting" | "fromPaddy"
+  // "walking" | "turning" | "toPaddy" | "rowStep" | "rowPlant" | "rowShift" | "fromPaddy"
   let state = "walking";
   let turnStart = 0;
   let turnFromY = 0;
@@ -402,11 +410,19 @@ function createWalker({
 
   // facing while off the path: pick whichever way actually points at the
   // paddy, since sideways motion isn't driven by dir the way path walking is
-  const paddyFacingY = paddyX !== null && paddyX > laneX ? -Math.PI / 2 : Math.PI / 2;
+  const paddyFacingY = paddyNearX !== null && paddyNearX > laneX ? -Math.PI / 2 : Math.PI / 2;
   let strafeStart = 0;
   let strafeFromX = laneX;
   let strafeToX = laneX;
-  let plantStart = 0;
+  let strafeZ = paddyZ;
+
+  // row-planting bookkeeping
+  let rowIndex = 0; // 0 = near row, 1 = far row
+  let rowDir = 1; // z direction walked while stepping through the current row
+  let rowX = paddyNearX;
+  let rowZ = paddyZ;
+  let cycleIndex = 0;
+  let phaseStart = 0; // start time of the current rowStep/rowPlant sub-phase
 
   farmer.position.set(laneX, 0, z);
   farmer.rotation.y = dir > 0 ? Math.PI : 0;
@@ -458,7 +474,7 @@ function createWalker({
           turnFromY = farmer.rotation.y;
           turnToY = dir > 0 ? 0 : Math.PI; // faces the opposite way once turned
           turnJointsAtStart = jointRotations(phase);
-        } else if (paddyX !== null && (prevZ - paddyZ) * (z - paddyZ) < 0) {
+        } else if (paddyNearX !== null && (prevZ - paddyZ) * (z - paddyZ) < 0) {
           // crossed paddyZ this frame — detour into the paddy
           z = paddyZ;
           farmer.position.set(laneX, 0, z);
@@ -466,51 +482,93 @@ function createWalker({
           state = "toPaddy";
           strafeStart = t;
           strafeFromX = laneX;
-          strafeToX = paddyX;
+          strafeToX = paddyNearX;
+          strafeZ = paddyZ;
         }
-      } else if (state === "toPaddy" || state === "fromPaddy") {
-        const entering = state === "toPaddy";
+      } else if (state === "toPaddy" || state === "rowShift" || state === "fromPaddy") {
         const dist = Math.abs(strafeToX - strafeFromX);
         const duration = Math.max(0.1, dist / strafeSpeed);
         const tt = Math.min(1, (t - strafeStart) / duration);
         const phase = t * Math.PI * 2 * stepFreq;
         const x = strafeFromX + (strafeToX - strafeFromX) * tt;
-        const sink = PADDY_SINK_Y * (entering ? smoothstep(0.5, 1, tt) : 1 - smoothstep(0, 0.5, tt));
+        const enteringPaddy = state !== "fromPaddy";
+        const sink = state === "toPaddy" ? PADDY_SINK_Y * smoothstep(0.5, 1, tt)
+          : state === "fromPaddy" ? PADDY_SINK_Y * (1 - smoothstep(0, 0.5, tt))
+          : PADDY_SINK_Y;
         applyJointRotations(jointRotations(phase));
-        farmer.position.set(x, sink + Math.abs(Math.sin(phase)) * 0.014, paddyZ);
-        farmer.rotation.y = entering ? paddyFacingY : paddyFacingY + Math.PI;
+        farmer.position.set(x, sink + Math.abs(Math.sin(phase)) * 0.014, strafeZ);
+        farmer.rotation.y = enteringPaddy ? paddyFacingY : paddyFacingY + Math.PI;
 
         if (tt >= 1) {
-          if (entering) {
-            state = "planting";
-            plantStart = t;
+          if (state === "toPaddy") {
+            rowIndex = 0;
+            rowDir = 1;
+            rowX = paddyNearX;
+            rowZ = strafeZ;
+            cycleIndex = 0;
+            phaseStart = t;
+            state = "rowStep";
+          } else if (state === "rowShift") {
+            rowIndex = 1;
+            rowDir = -1;
+            rowX = paddyFarX;
+            rowZ = strafeZ;
+            cycleIndex = 0;
+            phaseStart = t;
+            state = "rowStep";
           } else {
-            farmer.position.set(laneX, 0, paddyZ);
+            farmer.position.set(laneX, 0, strafeZ);
             farmer.rotation.y = dir > 0 ? Math.PI : 0;
             state = "walking";
           }
         }
-      } else if (state === "planting") {
-        const elapsed = t - plantStart;
-        const cycleIndex = Math.floor(elapsed / plantCycleDuration);
-        if (cycleIndex >= plantCycles) {
-          state = "fromPaddy";
-          strafeStart = t;
-          strafeFromX = paddyX;
-          strafeToX = laneX;
-        } else {
-          const p = (elapsed % plantCycleDuration) / plantCycleDuration;
-          const bow = Math.sin(p * Math.PI); // 0 -> 1 -> 0, one bow per cycle
-          joints.spine.rotation.x = STOOP_ANGLE - bow * 0.55;
-          joints.hipL.rotation.x = 0;
-          joints.hipR.rotation.x = 0;
-          joints.kneeL.rotation.x = -0.15 - bow * 0.25;
-          joints.kneeR.rotation.x = -0.15 - bow * 0.25;
-          joints.shoulderL.rotation.x = bow * 1.0;
-          joints.shoulderR.rotation.x = bow * 1.0;
-          joints.elbowL.rotation.x = 0.2 + bow * 0.6;
-          joints.elbowR.rotation.x = 0.2 + bow * 0.6;
-          farmer.position.set(paddyX, PADDY_SINK_Y - bow * 0.02, paddyZ);
+      } else if (state === "rowStep") {
+        // one short step forward through the row before the next plant
+        const fromZ = rowZ;
+        const toZ = rowZ + rowDir * rowStep;
+        const tt = Math.min(1, (t - phaseStart) / rowStepDuration);
+        const phase = t * Math.PI * 2 * stepFreq;
+        applyJointRotations(jointRotations(phase));
+        farmer.position.set(rowX, PADDY_SINK_Y + Math.abs(Math.sin(phase)) * 0.014, fromZ + (toZ - fromZ) * tt);
+        farmer.rotation.y = rowDir > 0 ? Math.PI : 0;
+
+        if (tt >= 1) {
+          rowZ = toZ;
+          phaseStart = t;
+          state = "rowPlant";
+        }
+      } else if (state === "rowPlant") {
+        const p = Math.min(1, (t - phaseStart) / plantCycleDuration);
+        const bow = Math.sin(p * Math.PI); // 0 -> 1 -> 0, one bow this cycle
+        joints.spine.rotation.x = STOOP_ANGLE - bow * 0.55;
+        joints.hipL.rotation.x = 0;
+        joints.hipR.rotation.x = 0;
+        joints.kneeL.rotation.x = -0.15 - bow * 0.25;
+        joints.kneeR.rotation.x = -0.15 - bow * 0.25;
+        joints.shoulderL.rotation.x = bow * 1.0;
+        joints.shoulderR.rotation.x = bow * 1.0;
+        joints.elbowL.rotation.x = 0.2 + bow * 0.6;
+        joints.elbowR.rotation.x = 0.2 + bow * 0.6;
+        farmer.position.set(rowX, PADDY_SINK_Y - bow * 0.02, rowZ);
+
+        if (p >= 1) {
+          cycleIndex += 1;
+          if (cycleIndex < plantCycles) {
+            phaseStart = t;
+            state = "rowStep";
+          } else if (rowIndex === 0) {
+            state = "rowShift";
+            strafeStart = t;
+            strafeFromX = paddyNearX;
+            strafeToX = paddyFarX;
+            strafeZ = rowZ;
+          } else {
+            state = "fromPaddy";
+            strafeStart = t;
+            strafeFromX = paddyFarX;
+            strafeToX = laneX;
+            strafeZ = rowZ;
+          }
         }
       } else {
         // turning in place: relax the stride toward a neutral stance while
@@ -622,7 +680,8 @@ export default function VillagePathWalkScene() {
       stepFreq: 0.7,
       turnDuration: 0.9,
       startDir: 1,
-      paddyX: PADDY_ENTRY_X_LEFT,
+      paddyNearX: PADDY_ROW_X_LEFT_NEAR,
+      paddyFarX: PADDY_ROW_X_LEFT_FAR,
     });
 
     const farmerB = buildFarmerRigged();
@@ -637,7 +696,8 @@ export default function VillagePathWalkScene() {
       stepFreq: 0.85,
       turnDuration: 0.9,
       startDir: -1,
-      paddyX: PADDY_ENTRY_X_RIGHT,
+      paddyNearX: PADDY_ROW_X_RIGHT_NEAR,
+      paddyFarX: PADDY_ROW_X_RIGHT_FAR,
     });
 
     const clock = new THREE.Clock();

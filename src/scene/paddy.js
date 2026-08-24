@@ -9,9 +9,9 @@ import { fbm, sampleType } from "./terrain";
 // Exported so the surrounding ground mesh can carve a matching depression —
 // otherwise the scene's single continuous ground plane sits at y~0 and
 // hides the whole basin (floor/water/rice) underneath it.
-export const PADDY_W = 2.2;
-export const PADDY_D = 1.7;
-export const PADDY_BANK_OUTER = 0.14;
+export const PADDY_W = 4.4; // 4x area (2x each dimension)
+export const PADDY_D = 3.4;
+export const PADDY_BANK_OUTER = 0.14; // levee thickness stays real-world-sized, doesn't scale with the field
 export const PADDY_FLOOR_Y = -0.09;
 
 const MUCK = {
@@ -199,20 +199,40 @@ export function buildPaddy() {
   floor.receiveShadow = true;
   root.add(floor);
 
+  // A hand-formed mud levee isn't laser-straight, so each side is a chain of
+  // short segments with their own small sideways wobble and height jitter,
+  // instead of one perfectly flat box.
   const wallH = bankTop - floorY;
-  function buildWall(w, d, x, z) {
-    const mat = buildSoilMaterial(MUCK, w, d, x, z);
-    const wall = new THREE.Mesh(new THREE.BoxGeometry(w, wallH, d), mat);
-    wall.position.set(x, floorY + wallH / 2, z);
-    wall.receiveShadow = true;
-    wall.castShadow = true;
-    return wall;
+  function buildWallLine(length, thickness, centerX, centerZ, axis) {
+    const group = new THREE.Group();
+    const segLen = 0.3;
+    const segCount = Math.max(1, Math.round(length / segLen));
+    const actualSegLen = length / segCount;
+    for (let i = 0; i < segCount; i++) {
+      const along = -length / 2 + actualSegLen * (i + 0.5);
+      const jitterPerp = (Math.random() - 0.5) * thickness * 0.4;
+      const jitterH = wallH * (0.82 + Math.random() * 0.36);
+      const x = axis === "x" ? centerX + along : centerX + jitterPerp;
+      const z = axis === "x" ? centerZ + jitterPerp : centerZ + along;
+      // segments overlap along their length so the sideways wobble never
+      // opens a gap between neighbors
+      const segW = axis === "x" ? actualSegLen * 1.15 : thickness;
+      const segD = axis === "x" ? thickness : actualSegLen * 1.15;
+      const mat = buildSoilMaterial(MUCK, segW, segD, x, z);
+      const seg = new THREE.Mesh(new THREE.BoxGeometry(segW, jitterH, segD), mat);
+      seg.position.set(x, floorY + jitterH / 2, z);
+      seg.receiveShadow = true;
+      seg.castShadow = true;
+      group.add(seg);
+    }
+    return group;
   }
   const banks = new THREE.Group();
-  banks.add(buildWall(hw * 2 + bankOuter * 2 + 0.02, bankOuter, 0, -hd - bankOuter / 2));
-  banks.add(buildWall(hw * 2 + bankOuter * 2 + 0.02, bankOuter, 0, hd + bankOuter / 2));
-  banks.add(buildWall(bankOuter, hd * 2, hw + bankOuter / 2, 0));
-  banks.add(buildWall(bankOuter, hd * 2, -hw - bankOuter / 2, 0));
+  const bankLength = hw * 2 + bankOuter * 2 + 0.02;
+  banks.add(buildWallLine(bankLength, bankOuter, 0, -hd - bankOuter / 2, "x"));
+  banks.add(buildWallLine(bankLength, bankOuter, 0, hd + bankOuter / 2, "x"));
+  banks.add(buildWallLine(hd * 2, bankOuter, hw + bankOuter / 2, 0, "z"));
+  banks.add(buildWallLine(hd * 2, bankOuter, -hw - bankOuter / 2, 0, "z"));
   root.add(banks);
 
   const { colorTex: waterColorTex, bumpTex: waterBumpTex } = paddyWaterTextures();

@@ -13,7 +13,7 @@ import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER } from "./paddy";
 // the identical code; the road-blending config below stays local since it's
 // specific to this ground.
 
-const GRID_SIZE = 11;
+const GRID_SIZE = 14; // widened from 11 so the 4x-bigger paddies still clear the path and ground edge
 
 const PATH = {
   clumpScale: 7, grainScale: 22, pebbleScale: 36,
@@ -26,10 +26,10 @@ const PATH_HALF_WIDTH = 0.6; // doubled from the reference study's 0.3
 const PATH_EDGE_SOFT = 0.3;
 
 // Paddies flank the path, clear of both its soft edge (|x| < 0.9) and the
-// ground bounds (|x| < 5.5).
+// ground bounds (|x| < 7).
 const PADDY_PLACEMENTS = [
-  { x: -2.8, z: 0 },
-  { x: 2.8, z: 0 },
+  { x: -3.6, z: 0 },
+  { x: 3.6, z: 0 },
 ];
 const PADDY_DEPRESS_Y = -0.2; // well below the paddy floor, so it's fully hidden once carved
 // each lane's walker treats its paddy as two rows: a near one (closer to
@@ -391,7 +391,7 @@ function buildFarmerRigged() {
 function createWalker({
   farmer, joints, laneX, walkZFrom, walkZTo, walkDuration, stepFreq, turnDuration, startDir,
   paddyNearX = null, paddyFarX = null, paddyZ = 0, strafeSpeed = 0.45,
-  plantCycles = 4, plantCycleDuration = 2.2, rowStep = 0.18, rowStepDuration = 0.6,
+  plantCycles = 8, plantCycleDuration = 2.2, rowStep = 0.18, rowStepDuration = 0.6, // 8 = 4 doubled, matching the paddy's doubled row length
 }) {
   const legSwing = 0.25;
   const kneeBend = 0.9;
@@ -598,7 +598,7 @@ function createWalker({
   };
 }
 
-const MIN_ZOOM = 0.12; // pinched all the way out still fits the whole 11x11 field, even on a narrow phone
+const MIN_ZOOM = 0.1; // pinched all the way out still fits the whole 14x14 field, even on a narrow phone
 const MAX_ZOOM = 3.2;
 
 export default function VillagePathWalkScene() {

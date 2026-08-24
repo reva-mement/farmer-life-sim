@@ -202,40 +202,47 @@ export function buildPaddy() {
   floor.receiveShadow = true;
   root.add(floor);
 
-  // A hand-formed mud levee isn't laser-straight, so each side is a chain of
-  // short segments with their own small sideways wobble and height jitter,
-  // instead of one perfectly flat box.
+  // A hand-formed mud levee is a sloped mound, not a vertical-walled curb —
+  // and it reads as dirt only if it's one continuous surface. Earlier this
+  // was a chain of separate boxes, which (correctly) read as individual
+  // bricks rather than mounded earth. Now each side is a single ribbon mesh,
+  // subdivided along its length, with the *top* edge tapered narrower than
+  // the base (a slope, not a right angle) and wobbled by fbm noise; only the
+  // top moves; the base stays put so it still seals against the ground.
   const wallH = bankTop - floorY;
-  function buildWallLine(length, thickness, centerX, centerZ, axis) {
-    const group = new THREE.Group();
-    const segLen = 0.3;
-    const segCount = Math.max(1, Math.round(length / segLen));
-    const actualSegLen = length / segCount;
-    for (let i = 0; i < segCount; i++) {
-      const along = -length / 2 + actualSegLen * (i + 0.5);
-      const jitterPerp = (Math.random() - 0.5) * thickness * 0.4;
-      const jitterH = wallH * (0.82 + Math.random() * 0.36);
-      const x = axis === "x" ? centerX + along : centerX + jitterPerp;
-      const z = axis === "x" ? centerZ + jitterPerp : centerZ + along;
-      // segments overlap along their length so the sideways wobble never
-      // opens a gap between neighbors
-      const segW = axis === "x" ? actualSegLen * 1.15 : thickness;
-      const segD = axis === "x" ? thickness : actualSegLen * 1.15;
-      const mat = buildSoilMaterial(MUCK, segW, segD, x, z);
-      const seg = new THREE.Mesh(new THREE.BoxGeometry(segW, jitterH, segD), mat);
-      seg.position.set(x, floorY + jitterH / 2, z);
-      seg.receiveShadow = true;
-      seg.castShadow = true;
-      group.add(seg);
+  function buildLeveeSide(length, thickness, centerX, centerZ, axis, seed) {
+    const baseHalfT = thickness;
+    const topHalfT = thickness * 0.45;
+    const lengthSegs = Math.max(8, Math.round(length / 0.22));
+    const geo = new THREE.BoxGeometry(length, wallH, baseHalfT * 2, lengthSegs, 1, 1);
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const lx = pos.getX(i);
+      const ly = pos.getY(i);
+      const lz = pos.getZ(i);
+      const alongFrac = lx / length;
+      const isTop = ly > 0 ? 1 : 0; // BoxGeometry with 1 height segment: exactly 2 rows, base and top
+      const thicknessScale = (baseHalfT + (topHalfT - baseHalfT) * isTop) / baseHalfT;
+      const sideways = (fbm(alongFrac * 8 + seed, 3.7, 3) - 0.5) * thickness * 0.9 * isTop;
+      const heightJitter = (fbm(alongFrac * 6 + seed, 1.3, 3) - 0.5) * wallH * 0.5 * isTop;
+      pos.setZ(i, lz * thicknessScale + sideways);
+      pos.setY(i, ly + heightJitter);
     }
-    return group;
+    geo.computeVertexNormals();
+    if (axis === "z") geo.rotateY(Math.PI / 2);
+    const mat = buildSoilMaterial(MUCK, length, baseHalfT * 2, centerX, centerZ);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(centerX, floorY + wallH / 2, centerZ);
+    mesh.receiveShadow = true;
+    mesh.castShadow = true;
+    return mesh;
   }
   const banks = new THREE.Group();
   const bankLength = hw * 2 + bankOuter * 2 + 0.02;
-  banks.add(buildWallLine(bankLength, bankOuter, 0, -hd - bankOuter / 2, "x"));
-  banks.add(buildWallLine(bankLength, bankOuter, 0, hd + bankOuter / 2, "x"));
-  banks.add(buildWallLine(hd * 2, bankOuter, hw + bankOuter / 2, 0, "z"));
-  banks.add(buildWallLine(hd * 2, bankOuter, -hw - bankOuter / 2, 0, "z"));
+  banks.add(buildLeveeSide(bankLength, bankOuter, 0, -hd - bankOuter / 2, "x", 0));
+  banks.add(buildLeveeSide(bankLength, bankOuter, 0, hd + bankOuter / 2, "x", 20));
+  banks.add(buildLeveeSide(hd * 2, bankOuter, hw + bankOuter / 2, 0, "z", 40));
+  banks.add(buildLeveeSide(hd * 2, bankOuter, -hw - bankOuter / 2, 0, "z", 60));
   root.add(banks);
 
   const { colorTex: waterColorTex, bumpTex: waterBumpTex } = paddyWaterTextures();

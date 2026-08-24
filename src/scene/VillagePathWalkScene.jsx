@@ -643,10 +643,31 @@ export default function VillagePathWalkScene() {
     const camera = new THREE.OrthographicCamera(
       (-d * width) / height, (d * width) / height, d, -d, 0.1, 100
     );
-    camera.position.set(5.2, 5.2, 5.2);
-    camera.lookAt(0, 0.3, 0);
+    const CAM_BASE_POS = new THREE.Vector3(5.2, 5.2, 5.2);
+    const CAM_BASE_TARGET = new THREE.Vector3(0, 0.3, 0);
+    camera.position.copy(CAM_BASE_POS);
+    camera.lookAt(CAM_BASE_TARGET);
     camera.zoom = 1;
     camera.updateProjectionMatrix();
+
+    // Pan basis: the camera only ever translates, never rotates, so its
+    // right/up vectors are constant — safe to compute once. panRight/panFwd
+    // are their ground-plane (Y=0) projections, letting a screen-space drag
+    // move the camera+target together along the ground, like grabbing the
+    // world with a finger.
+    camera.updateMatrixWorld(true); // matrixWorld is otherwise stale (identity) before the first render
+    const basisRight = new THREE.Vector3();
+    const basisUp = new THREE.Vector3();
+    const basisBack = new THREE.Vector3();
+    camera.matrixWorld.extractBasis(basisRight, basisUp, basisBack);
+    const panRight = new THREE.Vector3(basisRight.x, 0, basisRight.z).normalize();
+    const panFwd = new THREE.Vector3(basisUp.x, 0, basisUp.z).normalize(); // ground projection of "screen up"
+    const panOffset = new THREE.Vector3(0, 0, 0);
+    const PAN_LIMIT = GRID_SIZE / 2 + 1;
+    function applyCameraTransform() {
+      camera.position.copy(CAM_BASE_POS).add(panOffset);
+      camera.lookAt(CAM_BASE_TARGET.clone().add(panOffset));
+    }
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(width, height);
@@ -757,6 +778,7 @@ export default function VillagePathWalkScene() {
     ro.observe(mount);
 
     // ---- zoom: mouse wheel (desktop) + two-finger pinch (touch) ----
+    // ---- pan: one-finger / mouse drag, front-back-left-right on the ground ----
     function setZoom(z) {
       camera.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
       camera.updateProjectionMatrix();
@@ -768,6 +790,7 @@ export default function VillagePathWalkScene() {
     const activePointers = new Map();
     let pinchStartDist = null;
     let pinchStartZoom = 1;
+    let pinchActive = false; // true for the rest of the gesture once a 2nd finger joins
     function pointerDistance() {
       const pts = [...activePointers.values()];
       return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
@@ -775,20 +798,36 @@ export default function VillagePathWalkScene() {
     function onPointerDown(e) {
       activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (activePointers.size === 2) {
+        pinchActive = true;
         pinchStartDist = pointerDistance();
         pinchStartZoom = camera.zoom;
       }
     }
     function onPointerMove(e) {
-      if (!activePointers.has(e.pointerId)) return;
-      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const prev = activePointers.get(e.pointerId);
+      if (!prev) return;
+      const cur = { x: e.clientX, y: e.clientY };
+      activePointers.set(e.pointerId, cur);
       if (activePointers.size === 2 && pinchStartDist) {
         setZoom(pinchStartZoom * (pointerDistance() / pinchStartDist));
+      } else if (activePointers.size === 1 && !pinchActive) {
+        // drag-to-pan: 1 screen pixel moves exactly 1 world pixel's worth of
+        // ground, so the point under the finger/cursor tracks it exactly
+        const worldPerPixelY = (2 * d) / camera.zoom / mount.clientHeight;
+        const dxPixels = cur.x - prev.x;
+        const dyPixels = cur.y - prev.y;
+        const delta = panRight.clone().multiplyScalar(-dxPixels * worldPerPixelY)
+          .add(panFwd.clone().multiplyScalar(dyPixels * worldPerPixelY));
+        panOffset.add(delta);
+        panOffset.x = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, panOffset.x));
+        panOffset.z = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, panOffset.z));
+        applyCameraTransform();
       }
     }
     function onPointerUp(e) {
       activePointers.delete(e.pointerId);
       if (activePointers.size < 2) pinchStartDist = null;
+      if (activePointers.size === 0) pinchActive = false;
     }
     const dom = renderer.domElement;
     dom.style.touchAction = "none"; // stop the browser handling pinch as page zoom

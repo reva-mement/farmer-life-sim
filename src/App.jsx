@@ -1,9 +1,9 @@
-import PlaceholderScene from "./scene/PlaceholderScene";
+import VillagePathWalkScene from "./scene/VillagePathWalkScene";
 
 function App() {
   return (
     <div id="app-root">
-      <PlaceholderScene />
+      <VillagePathWalkScene />
     </div>
   );
 }

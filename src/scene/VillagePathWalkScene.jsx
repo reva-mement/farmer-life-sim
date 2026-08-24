@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { smoothstep, sampleType, SOIL } from "./terrain";
 import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
 import { buildFarmhouseVoxel } from "./houseVoxel";
+import { buildFarmhouseVoxelWorn } from "./houseVoxelWorn";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -730,6 +731,13 @@ export default function VillagePathWalkScene() {
     farmhouse.position.set(-3, 0, GRID_SIZE); // one side of the new tile, clear of the road
     farmhouse.rotation.y = Math.PI / 2; // face the road
     scene.add(farmhouse);
+
+    // A second, weathered household on the opposite side of the road -
+    // not every farmer's house is kept up the same.
+    const farmhouseWorn = buildFarmhouseVoxelWorn();
+    farmhouseWorn.position.set(3, 0, GRID_SIZE);
+    farmhouseWorn.rotation.y = -Math.PI / 2; // face the road
+    scene.add(farmhouseWorn);
 
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).

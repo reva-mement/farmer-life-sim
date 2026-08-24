@@ -62,7 +62,7 @@ const PATH = {
   speckAmt: 14, pebbleShadeAmt: 8, roughLow: 0.7, roughHigh: 0.95,
 };
 const PATH_CENTER_X = 0;
-const PATH_HALF_WIDTH = 0.3;
+const PATH_HALF_WIDTH = 0.6; // doubled from the reference study's 0.3
 const PATH_EDGE_SOFT = 0.3;
 
 function sampleType(cfg, u, v) {
@@ -399,6 +399,103 @@ function buildFarmerRigged() {
   };
 }
 
+// Encapsulates one farmer's walk-the-path state machine so multiple
+// instances can share the logic while walking their own lane (laneX) with
+// their own timing, instead of colliding on a single shared position.
+function createWalker({ farmer, joints, laneX, walkZFrom, walkZTo, walkDuration, stepFreq, turnDuration, startDir }) {
+  const legSwing = 0.25;
+  const kneeBend = 0.9;
+  const armSwing = 0.4;
+
+  let dir = startDir;
+  let z = startDir > 0 ? walkZFrom : walkZTo;
+  let state = "walking"; // "walking" | "turning"
+  let turnStart = 0;
+  let turnFromY = 0;
+  let turnToY = 0;
+  let turnJointsAtStart = null;
+
+  farmer.position.set(laneX, 0, z);
+  farmer.rotation.y = dir > 0 ? Math.PI : 0;
+
+  function jointRotations(phase) {
+    return {
+      hipL: legSwing * Math.sin(phase),
+      hipR: legSwing * Math.sin(phase + Math.PI),
+      kneeL: -kneeBend * Math.max(0, Math.sin(phase + 0.5)),
+      kneeR: -kneeBend * Math.max(0, Math.sin(phase + Math.PI + 0.5)),
+      shoulderL: armSwing * Math.sin(phase + Math.PI),
+      shoulderR: armSwing * Math.sin(phase),
+      elbowL: 0.15 + 0.15 * Math.max(0, Math.sin(phase + Math.PI + 0.3)),
+      elbowR: 0.15 + 0.15 * Math.max(0, Math.sin(phase + 0.3)),
+    };
+  }
+  function applyJointRotations(r) {
+    joints.hipL.rotation.x = r.hipL;
+    joints.hipR.rotation.x = r.hipR;
+    joints.kneeL.rotation.x = r.kneeL;
+    joints.kneeR.rotation.x = r.kneeR;
+    joints.shoulderL.rotation.x = r.shoulderL;
+    joints.shoulderR.rotation.x = r.shoulderR;
+    joints.elbowL.rotation.x = r.elbowL;
+    joints.elbowR.rotation.x = r.elbowR;
+  }
+
+  return {
+    update(t, dt) {
+      if (state === "walking") {
+        const span = walkZTo - walkZFrom;
+        const baseSpeed = span / walkDuration;
+        const phase = t * Math.PI * 2 * stepFreq;
+        // forward speed pulses with the stride: fastest as the legs cross
+        // underneath (phase 0, π), nearly paused right as a foot plants
+        // (phase π/2, 3π/2) — instead of a constant glide.
+        const speedMultiplier = Math.abs(Math.cos(phase)) * 1.571; // avg(|cos|)=2/π, so this averages to 1
+        z += dir * baseSpeed * speedMultiplier * dt;
+        applyJointRotations(jointRotations(phase));
+        farmer.position.set(laneX, Math.abs(Math.sin(phase)) * 0.014, z);
+        farmer.rotation.y = dir > 0 ? Math.PI : 0;
+
+        if (z >= walkZTo || z <= walkZFrom) {
+          z = z >= walkZTo ? walkZTo : walkZFrom;
+          farmer.position.set(laneX, 0, z);
+          state = "turning";
+          turnStart = t;
+          turnFromY = farmer.rotation.y;
+          turnToY = dir > 0 ? 0 : Math.PI; // faces the opposite way once turned
+          turnJointsAtStart = jointRotations(phase);
+        }
+      } else {
+        // turning in place: relax the stride toward a neutral stance while
+        // rotating 180° to face back the way it came
+        const tt = Math.min(1, (t - turnStart) / turnDuration);
+        const ease = tt < 0.5 ? 2 * tt * tt : 1 - Math.pow(-2 * tt + 2, 2) / 2;
+        farmer.rotation.y = turnFromY + (turnToY - turnFromY) * ease;
+        const relax = 1 - ease;
+        applyJointRotations({
+          hipL: turnJointsAtStart.hipL * relax,
+          hipR: turnJointsAtStart.hipR * relax,
+          kneeL: turnJointsAtStart.kneeL * relax,
+          kneeR: turnJointsAtStart.kneeR * relax,
+          shoulderL: turnJointsAtStart.shoulderL * relax,
+          shoulderR: turnJointsAtStart.shoulderR * relax,
+          elbowL: turnJointsAtStart.elbowL * relax + 0.15 * ease,
+          elbowR: turnJointsAtStart.elbowR * relax + 0.15 * ease,
+        });
+        farmer.position.set(laneX, Math.sin(tt * Math.PI) * 0.01, z);
+
+        if (tt >= 1) {
+          dir = -dir;
+          state = "walking";
+        }
+      }
+    },
+  };
+}
+
+const MIN_ZOOM = 0.6;
+const MAX_ZOOM = 3.2;
+
 export default function VillagePathWalkScene() {
   const mountRef = useRef(null);
 
@@ -414,6 +511,8 @@ export default function VillagePathWalkScene() {
     );
     camera.position.set(5.2, 5.2, 5.2);
     camera.lookAt(0, 0.3, 0);
+    camera.zoom = 1;
+    camera.updateProjectionMatrix();
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(width, height);
@@ -448,108 +547,47 @@ export default function VillagePathWalkScene() {
     const ground = buildGround();
     scene.add(ground);
 
-    const { group: farmer, joints } = buildFarmerRigged();
-    // The character no longer casts a real dynamic shadow — every joint move
-    // was forcing the shadow map to be recomputed, which is what caused the
-    // flicker. The AO decal under its feet is enough to read as "grounded".
-    farmer.traverse((obj) => {
-      obj.castShadow = false;
-    });
-    scene.add(farmer);
-
-    // walk slowly back and forth along the path (x = PATH_CENTER_X)
+    // Two farmers, each in their own lane offset from the path center so
+    // they can never collide even when crossing at the same z. Slightly
+    // different pacing keeps them from looking robotically synced.
     const walkZFrom = -4.3;
     const walkZTo = 4.3;
-    const walkDuration = 32; // seconds, one-way — half the previous speed
-    const stepFreq = 0.7; // strides per second — matches a slow, relaxed pace
-    const turnDuration = 0.9;
-    let dir = 1;
-    let z = walkZFrom;
-    let state = "walking"; // "walking" | "turning"
-    let turnStart = 0;
-    let turnFromY = Math.PI;
-    let turnToY = 0;
-    let turnJointsAtStart = null;
+    const LANE_OFFSET = 0.18; // well inside the widened solid path (half-width 0.6)
+
+    const farmerA = buildFarmerRigged();
+    farmerA.group.traverse((obj) => { obj.castShadow = false; });
+    scene.add(farmerA.group);
+    const walkerA = createWalker({
+      farmer: farmerA.group,
+      joints: farmerA.joints,
+      laneX: PATH_CENTER_X - LANE_OFFSET,
+      walkZFrom, walkZTo,
+      walkDuration: 32,
+      stepFreq: 0.7,
+      turnDuration: 0.9,
+      startDir: 1,
+    });
+
+    const farmerB = buildFarmerRigged();
+    farmerB.group.traverse((obj) => { obj.castShadow = false; });
+    scene.add(farmerB.group);
+    const walkerB = createWalker({
+      farmer: farmerB.group,
+      joints: farmerB.joints,
+      laneX: PATH_CENTER_X + LANE_OFFSET,
+      walkZFrom, walkZTo,
+      walkDuration: 27,
+      stepFreq: 0.85,
+      turnDuration: 0.9,
+      startDir: -1,
+    });
+
     const clock = new THREE.Clock();
-
-    const legSwing = 0.25;
-    const kneeBend = 0.9;
-    const armSwing = 0.4;
-
-    function jointRotations(phase) {
-      return {
-        hipL: legSwing * Math.sin(phase),
-        hipR: legSwing * Math.sin(phase + Math.PI),
-        kneeL: -kneeBend * Math.max(0, Math.sin(phase + 0.5)),
-        kneeR: -kneeBend * Math.max(0, Math.sin(phase + Math.PI + 0.5)),
-        shoulderL: armSwing * Math.sin(phase + Math.PI),
-        shoulderR: armSwing * Math.sin(phase),
-        elbowL: 0.15 + 0.15 * Math.max(0, Math.sin(phase + Math.PI + 0.3)),
-        elbowR: 0.15 + 0.15 * Math.max(0, Math.sin(phase + 0.3)),
-      };
-    }
-    function applyJointRotations(r) {
-      joints.hipL.rotation.x = r.hipL;
-      joints.hipR.rotation.x = r.hipR;
-      joints.kneeL.rotation.x = r.kneeL;
-      joints.kneeR.rotation.x = r.kneeR;
-      joints.shoulderL.rotation.x = r.shoulderL;
-      joints.shoulderR.rotation.x = r.shoulderR;
-      joints.elbowL.rotation.x = r.elbowL;
-      joints.elbowR.rotation.x = r.elbowR;
-    }
-
     function animate() {
       const dt = clock.getDelta();
       const t = clock.getElapsedTime();
-
-      if (state === "walking") {
-        const span = walkZTo - walkZFrom;
-        const baseSpeed = span / walkDuration;
-        const phase = t * Math.PI * 2 * stepFreq;
-        // forward speed pulses with the stride: fastest as the legs cross
-        // underneath (phase 0, π), nearly paused right as a foot plants
-        // (phase π/2, 3π/2) — instead of a constant glide.
-        const speedMultiplier = Math.abs(Math.cos(phase)) * 1.571; // avg(|cos|)=2/π, so this averages to 1
-        z += dir * baseSpeed * speedMultiplier * dt;
-        applyJointRotations(jointRotations(phase));
-        farmer.position.set(PATH_CENTER_X, Math.abs(Math.sin(phase)) * 0.014, z);
-        farmer.rotation.y = dir > 0 ? Math.PI : 0;
-
-        if (z >= walkZTo || z <= walkZFrom) {
-          z = z >= walkZTo ? walkZTo : walkZFrom;
-          farmer.position.set(PATH_CENTER_X, 0, z);
-          state = "turning";
-          turnStart = t;
-          turnFromY = farmer.rotation.y;
-          turnToY = dir > 0 ? 0 : Math.PI; // faces the opposite way once turned
-          turnJointsAtStart = jointRotations(phase);
-        }
-      } else {
-        // turning in place: relax the stride toward a neutral stance while
-        // rotating 180° to face back the way it came
-        const tt = Math.min(1, (t - turnStart) / turnDuration);
-        const ease = tt < 0.5 ? 2 * tt * tt : 1 - Math.pow(-2 * tt + 2, 2) / 2;
-        farmer.rotation.y = turnFromY + (turnToY - turnFromY) * ease;
-        const relax = 1 - ease;
-        applyJointRotations({
-          hipL: turnJointsAtStart.hipL * relax,
-          hipR: turnJointsAtStart.hipR * relax,
-          kneeL: turnJointsAtStart.kneeL * relax,
-          kneeR: turnJointsAtStart.kneeR * relax,
-          shoulderL: turnJointsAtStart.shoulderL * relax,
-          shoulderR: turnJointsAtStart.shoulderR * relax,
-          elbowL: turnJointsAtStart.elbowL * relax + 0.15 * ease,
-          elbowR: turnJointsAtStart.elbowR * relax + 0.15 * ease,
-        });
-        farmer.position.set(PATH_CENTER_X, Math.sin(tt * Math.PI) * 0.01, z);
-
-        if (tt >= 1) {
-          dir = -dir;
-          state = "walking";
-        }
-      }
-
+      walkerA.update(t, dt);
+      walkerB.update(t, dt);
       renderer.render(scene, camera);
     }
     renderer.setAnimationLoop(animate);
@@ -567,9 +605,56 @@ export default function VillagePathWalkScene() {
     const ro = new ResizeObserver(handleResize);
     ro.observe(mount);
 
+    // ---- zoom: mouse wheel (desktop) + two-finger pinch (touch) ----
+    function setZoom(z) {
+      camera.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+      camera.updateProjectionMatrix();
+    }
+    function onWheel(e) {
+      e.preventDefault();
+      setZoom(camera.zoom * (1 - e.deltaY * 0.001));
+    }
+    const activePointers = new Map();
+    let pinchStartDist = null;
+    let pinchStartZoom = 1;
+    function pointerDistance() {
+      const pts = [...activePointers.values()];
+      return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    }
+    function onPointerDown(e) {
+      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activePointers.size === 2) {
+        pinchStartDist = pointerDistance();
+        pinchStartZoom = camera.zoom;
+      }
+    }
+    function onPointerMove(e) {
+      if (!activePointers.has(e.pointerId)) return;
+      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activePointers.size === 2 && pinchStartDist) {
+        setZoom(pinchStartZoom * (pointerDistance() / pinchStartDist));
+      }
+    }
+    function onPointerUp(e) {
+      activePointers.delete(e.pointerId);
+      if (activePointers.size < 2) pinchStartDist = null;
+    }
+    const dom = renderer.domElement;
+    dom.style.touchAction = "none"; // stop the browser handling pinch as page zoom
+    dom.addEventListener("wheel", onWheel, { passive: false });
+    dom.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+
     return () => {
       renderer.setAnimationLoop(null);
       ro.disconnect();
+      dom.removeEventListener("wheel", onWheel);
+      dom.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
       scene.traverse((obj) => {
         if (obj.geometry) obj.geometry.dispose();
         if (obj.material) {

@@ -65,6 +65,24 @@ function houseFlatten(worldX, worldZ) {
   return t;
 }
 
+// ---------- tile management ----------
+// Each tile is one GRID_SIZE x GRID_SIZE square, addressed by integer
+// (tileX, tileZ) - see buildGroundTile. TILE_CONTENT describes what beyond
+// the ground itself belongs in a given tile, keyed the same way loadTile
+// below looks it up. Phase 1 of the 40x40-tile roadmap: this is still a
+// fixed, hand-authored set (matching today's 2-tile world exactly, nothing
+// streams in/out at runtime), but it's the hook a later phase's procedural
+// per-tile content generation replaces this with. Paddies and the farmer
+// walkers stay outside this system for now - they're tightly coupled to
+// the walk-animation code further below and aren't part of the "does the
+// ground scale" question this tile system exists to answer.
+function tileKey(tileX, tileZ) {
+  return `${tileX},${tileZ}`;
+}
+const TILE_CONTENT = {
+  [tileKey(0, 1)]: { houses: HOUSE_PLACEMENTS },
+};
+
 // The scene's ground is one continuous mesh, so a paddy sitting "in" it
 // needs its own vertices pushed down first — otherwise the ground plane at
 // y~0 just covers the basin (floor/water/rice) sitting below it. The
@@ -134,7 +152,7 @@ function terrainRoll(worldX, worldZ, pathT) {
   const n = fbm(worldX * TERRAIN_ROLL_SCALE, worldZ * TERRAIN_ROLL_SCALE, 4);
   return (n - 0.5) * 2 * TERRAIN_ROLL_AMP * (1 - pathT * 0.85);
 }
-function buildGroundTextures(texW, texH, worldW, worldD, zCenter) {
+function buildGroundTextures(texW, texH, worldW, worldD, xCenter, zCenter) {
   const colorCanvas = document.createElement("canvas");
   colorCanvas.width = texW; colorCanvas.height = texH;
   const cctx = colorCanvas.getContext("2d");
@@ -150,7 +168,7 @@ function buildGroundTextures(texW, texH, worldW, worldD, zCenter) {
   for (let py = 0; py < texH; py++) {
     const worldZ = (py / texH) * worldD - worldD / 2 + zCenter;
     for (let px = 0; px < texW; px++) {
-      const worldX = (px / texW) * worldW - worldW / 2;
+      const worldX = (px / texW) * worldW - worldW / 2 + xCenter;
       const s = groundSample(worldX, worldZ);
       const idx = (py * texW + px) * 4;
       cimg.data[idx] = Math.max(0, Math.min(255, s.r));
@@ -174,16 +192,27 @@ function buildGroundTextures(texW, texH, worldW, worldD, zCenter) {
   const roughTex = new THREE.CanvasTexture(roughCanvas);
   return { colorTex, bumpTex, roughTex };
 }
-// zCenter offsets the whole plane along world Z, so a second tile can be
-// appended north of the original (still centered at z=0) without moving
-// anything already placed there (paddies, the farmer's walk range, etc).
-function buildGround(worldD, zCenter) {
+// One tile's ground mesh - GRID_SIZE x GRID_SIZE, centered at
+// (tileX*GRID_SIZE, tileZ*GRID_SIZE). Was a single buildGround(worldD,
+// zCenter) that built one big mesh spanning as many tiles as needed at
+// once (originally 1, then 2 once a road-only tile was appended); split so
+// tiles can be loaded/unloaded independently (see loadTile/unloadTile in
+// the component below) - same sampling functions, same visual result per
+// tile, just addressable and disposable one at a time. First step toward
+// the 40x40-tile world: nothing here streams yet (Phase 1 just lays the
+// tile plumbing under the still-fixed 2-tile world), but later phases can
+// drive loadTile/unloadTile from the camera position without another
+// rewrite of this function.
+function buildGroundTile(tileX, tileZ) {
   const worldW = GRID_SIZE;
+  const worldD = GRID_SIZE;
+  const xCenter = tileX * GRID_SIZE;
+  const zCenter = tileZ * GRID_SIZE;
   const segs = 88;
   const geo = new THREE.PlaneGeometry(worldW, worldD, segs, segs);
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
-    const worldX = pos.getX(i);
+    const worldX = pos.getX(i) + xCenter;
     // geo.rotateX(-PI/2) below maps local Y -> world Z *negated* (verified
     // empirically: a vertex at local Y=-1 ends up at Z=+1). buildGroundTextures'
     // py-based sampling already accounts for this; this loop needs the same
@@ -202,20 +231,21 @@ function buildGround(worldD, zCenter) {
   }
   geo.computeVertexNormals();
   geo.rotateX(-Math.PI / 2);
-  // Lower than the original tile's 130: the ground is now 2x the area
-  // (a second, road-only tile appended), and generating the color/bump/
-  // rough canvases is a synchronous per-pixel JS loop — at 130 the total
-  // pixel count made the page hang for ~10s on load.
+  // Generating the color/bump/rough canvases is a synchronous per-pixel JS
+  // loop, per tile now instead of for the whole world at once - still the
+  // scaling bottleneck the 40x40 roadmap's Phase 2 (moving this to a GPU
+  // shader) targets, but bounded per-tile now rather than growing with the
+  // total world size.
   const texPerUnit = 75;
   const { colorTex, bumpTex, roughTex } = buildGroundTextures(
-    Math.round(worldW * texPerUnit), Math.round(worldD * texPerUnit), worldW, worldD, zCenter
+    Math.round(worldW * texPerUnit), Math.round(worldD * texPerUnit), worldW, worldD, xCenter, zCenter
   );
   const mat = new THREE.MeshStandardMaterial({
     map: colorTex, bumpMap: bumpTex, bumpScale: 0.015,
     roughnessMap: roughTex, roughness: 1, metalness: 0.02,
   });
   const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.z = zCenter;
+  mesh.position.set(xCenter, 0, zCenter);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   return mesh;
@@ -764,26 +794,62 @@ export default function VillagePathWalkScene() {
     const fill = new THREE.AmbientLight(0x7d8caa, 0.18);
     scene.add(fill);
 
-    // The original tile (paddies, farmer walk range) stays at z in
-    // [-GRID_SIZE/2, GRID_SIZE/2]; a second, road-only tile of the same
-    // size is appended north of it, extending the same continuous ground
-    // (the road/soil blend is Z-independent, so it just keeps going).
-    const worldD = GRID_SIZE * 2;
-    const groundZCenter = GRID_SIZE / 2;
-    const ground = buildGround(worldD, groundZCenter);
-    scene.add(ground);
+    // ---- tile load/unload (see TILE_CONTENT above) ----
+    // loadedTiles tracks what's live so a tile can be torn down cleanly:
+    // scene.remove() plus disposing every geometry/material/texture it
+    // added, not just the ones a later caller happens to remember. Phase 1
+    // calls loadTile with a fixed list (right below) and never unloads -
+    // the plumbing is here so a later phase can drive both calls from the
+    // camera's position instead, without touching this function again.
+    const loadedTiles = new Map();
+    function loadTile(tileX, tileZ) {
+      const key = tileKey(tileX, tileZ);
+      if (loadedTiles.has(key)) return;
+      const group = new THREE.Group();
+      const geometries = [];
+      const materials = [];
+      const textures = [];
 
-    // The two houses on the road tile - one well-kept, one weathered (see
-    // HOUSE_PLACEMENTS). Fully voxel/dot-art - the ragged eave + weathering
-    // noise on the worn house does enough to hide the cube grid that the
-    // smooth-mesh roof (houseVoxelSmoothRoof.js/houseVoxelWornSmoothRoof.js)
-    // wasn't worth the extra complexity at normal viewing distance.
-    for (const h of HOUSE_PLACEMENTS) {
-      const house = h.worn ? buildFarmhouseVoxelWorn() : buildFarmhouseVoxel();
-      house.position.set(h.x, 0, h.z);
-      house.rotation.y = h.rotY;
-      scene.add(house);
+      const groundMesh = buildGroundTile(tileX, tileZ);
+      group.add(groundMesh);
+      geometries.push(groundMesh.geometry);
+      materials.push(groundMesh.material);
+      textures.push(groundMesh.material.map, groundMesh.material.bumpMap, groundMesh.material.roughnessMap);
+
+      const content = TILE_CONTENT[key];
+      if (content?.houses) {
+        for (const h of content.houses) {
+          const house = h.worn ? buildFarmhouseVoxelWorn() : buildFarmhouseVoxel();
+          house.position.set(h.x, 0, h.z);
+          house.rotation.y = h.rotY;
+          group.add(house);
+          house.traverse((obj) => {
+            if (obj.geometry) geometries.push(obj.geometry);
+            if (obj.material) materials.push(obj.material);
+          });
+        }
+      }
+
+      scene.add(group);
+      loadedTiles.set(key, { group, geometries, materials, textures });
     }
+    function unloadTile(tileX, tileZ) {
+      const key = tileKey(tileX, tileZ);
+      const entry = loadedTiles.get(key);
+      if (!entry) return;
+      scene.remove(entry.group);
+      entry.geometries.forEach((g) => g.dispose());
+      entry.materials.forEach((m) => m.dispose());
+      entry.textures.forEach((t) => t && t.dispose());
+      loadedTiles.delete(key);
+    }
+
+    // Fixed for now, matching the current world exactly: (0,0) is the
+    // original tile (paddies, farmer walk range, z in [-7,7]); (0,1) is
+    // the road-only tile appended north of it (z in [7,21]), holding the
+    // two houses.
+    loadTile(0, 0);
+    loadTile(0, 1);
 
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).

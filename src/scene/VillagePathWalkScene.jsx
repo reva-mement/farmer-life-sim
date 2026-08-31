@@ -4,6 +4,7 @@ import { smoothstep, sampleType, fbm, SOIL } from "./terrain";
 import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
 import { buildFarmhouseVoxel } from "./houseVoxel";
 import { buildFarmhouseVoxelWorn } from "./houseVoxelWorn";
+import { bakeGroundTextures, buildGroundMaterial } from "./groundMaterial";
 
 // Ported from reference/village-path-walk-study.jsx — per
 // farmer-sim-design-doc-v2.md section 4, this is the most complete
@@ -152,46 +153,6 @@ function terrainRoll(worldX, worldZ, pathT) {
   const n = fbm(worldX * TERRAIN_ROLL_SCALE, worldZ * TERRAIN_ROLL_SCALE, 4);
   return (n - 0.5) * 2 * TERRAIN_ROLL_AMP * (1 - pathT * 0.85);
 }
-function buildGroundTextures(texW, texH, worldW, worldD, xCenter, zCenter) {
-  const colorCanvas = document.createElement("canvas");
-  colorCanvas.width = texW; colorCanvas.height = texH;
-  const cctx = colorCanvas.getContext("2d");
-  const bumpCanvas = document.createElement("canvas");
-  bumpCanvas.width = texW; bumpCanvas.height = texH;
-  const bctx = bumpCanvas.getContext("2d");
-  const roughCanvas = document.createElement("canvas");
-  roughCanvas.width = texW; roughCanvas.height = texH;
-  const rctx = roughCanvas.getContext("2d");
-  const cimg = cctx.createImageData(texW, texH);
-  const bimg = bctx.createImageData(texW, texH);
-  const rimg = rctx.createImageData(texW, texH);
-  for (let py = 0; py < texH; py++) {
-    const worldZ = (py / texH) * worldD - worldD / 2 + zCenter;
-    for (let px = 0; px < texW; px++) {
-      const worldX = (px / texW) * worldW - worldW / 2 + xCenter;
-      const s = groundSample(worldX, worldZ);
-      const idx = (py * texW + px) * 4;
-      cimg.data[idx] = Math.max(0, Math.min(255, s.r));
-      cimg.data[idx + 1] = Math.max(0, Math.min(255, s.g));
-      cimg.data[idx + 2] = Math.max(0, Math.min(255, s.b));
-      cimg.data[idx + 3] = 255;
-      const hByte = Math.max(0, Math.min(255, s.bumpHeight * 255));
-      bimg.data[idx] = bimg.data[idx + 1] = bimg.data[idx + 2] = hByte;
-      bimg.data[idx + 3] = 255;
-      const rByte = Math.max(0, Math.min(255, s.rough * 255));
-      rimg.data[idx] = rimg.data[idx + 1] = rimg.data[idx + 2] = rByte;
-      rimg.data[idx + 3] = 255;
-    }
-  }
-  cctx.putImageData(cimg, 0, 0);
-  bctx.putImageData(bimg, 0, 0);
-  rctx.putImageData(rimg, 0, 0);
-  const colorTex = new THREE.CanvasTexture(colorCanvas);
-  colorTex.encoding = THREE.sRGBEncoding;
-  const bumpTex = new THREE.CanvasTexture(bumpCanvas);
-  const roughTex = new THREE.CanvasTexture(roughCanvas);
-  return { colorTex, bumpTex, roughTex };
-}
 // One tile's ground mesh - GRID_SIZE x GRID_SIZE, centered at
 // (tileX*GRID_SIZE, tileZ*GRID_SIZE). Was a single buildGround(worldD,
 // zCenter) that built one big mesh spanning as many tiles as needed at
@@ -203,7 +164,15 @@ function buildGroundTextures(texW, texH, worldW, worldD, xCenter, zCenter) {
 // tile plumbing under the still-fixed 2-tile world), but later phases can
 // drive loadTile/unloadTile from the camera position without another
 // rewrite of this function.
-function buildGroundTile(tileX, tileZ) {
+//
+// Color/roughness are baked to two small textures per tile on the GPU (see
+// bakeGroundTextures in groundMaterial.js) instead of the old CPU canvas
+// loop - same visual result, but a GPU-parallel render pass instead of a
+// main-thread-blocking pixel loop, so it no longer scales badly with tile
+// count. renderer and groundOpts (the soil/path/paddy config the bake
+// needs) are passed in rather than imported, keeping this function - and
+// groundMaterial.js - decoupled from this file's specific constants.
+function buildGroundTile(tileX, tileZ, renderer, groundOpts) {
   const worldW = GRID_SIZE;
   const worldD = GRID_SIZE;
   const xCenter = tileX * GRID_SIZE;
@@ -214,12 +183,13 @@ function buildGroundTile(tileX, tileZ) {
   for (let i = 0; i < pos.count; i++) {
     const worldX = pos.getX(i) + xCenter;
     // geo.rotateX(-PI/2) below maps local Y -> world Z *negated* (verified
-    // empirically: a vertex at local Y=-1 ends up at Z=+1). buildGroundTextures'
-    // py-based sampling already accounts for this; this loop needs the same
-    // sign or the two fall out of sync — invisible while the ground was
-    // Z-symmetric (paddies sat exactly on the mirror axis), but once a
-    // second tile made it asymmetric, vertex heights and texture colors
-    // started describing two different physical locations.
+    // empirically: a vertex at local Y=-1 ends up at Z=+1) - this loop needs
+    // that sign for the height/roll/flatten/depress sampling below to
+    // describe the same physical location the vertex actually ends up at.
+    // (The GPU bake in groundMaterial.js doesn't need this: it maps its own
+    // UV space to world position independently via uCenter/uWorldSize, so
+    // it can't fall out of sync with this loop the way the old CPU-baked
+    // canvas sampling once could.)
     const worldZ = -pos.getY(i) + zCenter;
     const s = groundSample(worldX, worldZ);
     const roll = terrainRoll(worldX, worldZ, s.pathT);
@@ -231,24 +201,17 @@ function buildGroundTile(tileX, tileZ) {
   }
   geo.computeVertexNormals();
   geo.rotateX(-Math.PI / 2);
-  // Generating the color/bump/rough canvases is a synchronous per-pixel JS
-  // loop, per tile now instead of for the whole world at once - still the
-  // scaling bottleneck the 40x40 roadmap's Phase 2 (moving this to a GPU
-  // shader) targets, but bounded per-tile now rather than growing with the
-  // total world size.
   const texPerUnit = 75;
-  const { colorTex, bumpTex, roughTex } = buildGroundTextures(
-    Math.round(worldW * texPerUnit), Math.round(worldD * texPerUnit), worldW, worldD, xCenter, zCenter
+  const { colorTarget, roughTarget } = bakeGroundTextures(
+    renderer, Math.round(worldW * texPerUnit), Math.round(worldD * texPerUnit),
+    worldW, worldD, xCenter, zCenter, groundOpts
   );
-  const mat = new THREE.MeshStandardMaterial({
-    map: colorTex, bumpMap: bumpTex, bumpScale: 0.015,
-    roughnessMap: roughTex, roughness: 1, metalness: 0.02,
-  });
+  const mat = buildGroundMaterial(colorTarget, roughTarget);
   const mesh = new THREE.Mesh(geo, mat);
   mesh.position.set(xCenter, 0, zCenter);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
-  return mesh;
+  return { mesh, renderTargets: [colorTarget, roughTarget] };
 }
 
 // ---------- farmer character ----------
@@ -794,13 +757,23 @@ export default function VillagePathWalkScene() {
     const fill = new THREE.AmbientLight(0x7d8caa, 0.18);
     scene.add(fill);
 
+    // Soil/path/paddy config the GPU bake needs (see buildGroundTile /
+    // groundMaterial.js) - built once and reused for every tile's bake.
+    const groundOpts = {
+      soil: SOIL, path: PATH, pathCenterX: PATH_CENTER_X,
+      pathHalfWidth: PATH_HALF_WIDTH, pathEdgeSoft: PATH_EDGE_SOFT,
+      paddyPlacements: PADDY_PLACEMENTS, paddyHalfW: PADDY_W / 2, paddyHalfD: PADDY_D / 2,
+      paddyBankOuter: PADDY_BANK_OUTER, paddyFringeWidth: PADDY_FRINGE_WIDTH,
+      paddyFringeColor: PADDY_FRINGE_COLOR,
+    };
+
     // ---- tile load/unload (see TILE_CONTENT above) ----
     // loadedTiles tracks what's live so a tile can be torn down cleanly:
-    // scene.remove() plus disposing every geometry/material/texture it
-    // added, not just the ones a later caller happens to remember. Phase 1
-    // calls loadTile with a fixed list (right below) and never unloads -
-    // the plumbing is here so a later phase can drive both calls from the
-    // camera's position instead, without touching this function again.
+    // scene.remove() plus disposing every geometry/material/render-target
+    // it added. Phase 1 calls loadTile with a fixed list (right below) and
+    // never unloads - the plumbing is here so a later phase can drive both
+    // calls from the camera's position instead, without touching this
+    // function again.
     const loadedTiles = new Map();
     function loadTile(tileX, tileZ) {
       const key = tileKey(tileX, tileZ);
@@ -808,13 +781,13 @@ export default function VillagePathWalkScene() {
       const group = new THREE.Group();
       const geometries = [];
       const materials = [];
-      const textures = [];
+      const renderTargets = [];
 
-      const groundMesh = buildGroundTile(tileX, tileZ);
+      const { mesh: groundMesh, renderTargets: groundTargets } = buildGroundTile(tileX, tileZ, renderer, groundOpts);
       group.add(groundMesh);
       geometries.push(groundMesh.geometry);
       materials.push(groundMesh.material);
-      textures.push(groundMesh.material.map, groundMesh.material.bumpMap, groundMesh.material.roughnessMap);
+      renderTargets.push(...groundTargets);
 
       const content = TILE_CONTENT[key];
       if (content?.houses) {
@@ -831,7 +804,7 @@ export default function VillagePathWalkScene() {
       }
 
       scene.add(group);
-      loadedTiles.set(key, { group, geometries, materials, textures });
+      loadedTiles.set(key, { group, geometries, materials, renderTargets });
     }
     function unloadTile(tileX, tileZ) {
       const key = tileKey(tileX, tileZ);
@@ -840,7 +813,7 @@ export default function VillagePathWalkScene() {
       scene.remove(entry.group);
       entry.geometries.forEach((g) => g.dispose());
       entry.materials.forEach((m) => m.dispose());
-      entry.textures.forEach((t) => t && t.dispose());
+      entry.renderTargets.forEach((rt) => rt.dispose());
       loadedTiles.delete(key);
     }
 

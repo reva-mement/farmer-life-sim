@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import { smoothstep, sampleType, fbm, SOIL } from "./terrain";
+import { smoothstep, sampleType, fbm, hash, SOIL } from "./terrain";
 import { buildPaddy, PADDY_W, PADDY_D, PADDY_BANK_OUTER, PADDY_FRINGE_COLOR } from "./paddy";
 import { buildFarmhouseVoxel } from "./houseVoxel";
 import { buildFarmhouseVoxelWorn } from "./houseVoxelWorn";
@@ -55,11 +55,14 @@ const HOUSE_PLACEMENTS = [
 // Ground stays flat right under each house (it sits at a fixed y=0) instead
 // of following the new rolling-terrain displacement below - same idea as
 // paddyDepression, just flattening toward 0 instead of carving a basin.
+// Takes the specific house list to flatten under (rather than closing over
+// a module-level constant) since Phase 3 gives each tile its own,
+// procedurally-decided set - see getTileContent below.
 const HOUSE_FLATTEN_RADIUS = 1.5;
 const HOUSE_FLATTEN_WIDTH = 1.1;
-function houseFlatten(worldX, worldZ) {
+function houseFlatten(worldX, worldZ, housePlacements) {
   let t = 0;
-  for (const h of HOUSE_PLACEMENTS) {
+  for (const h of housePlacements) {
     const dist = Math.hypot(worldX - h.x, worldZ - h.z);
     t = Math.max(t, 1 - smoothstep(HOUSE_FLATTEN_RADIUS, HOUSE_FLATTEN_RADIUS + HOUSE_FLATTEN_WIDTH, dist));
   }
@@ -68,21 +71,44 @@ function houseFlatten(worldX, worldZ) {
 
 // ---------- tile management ----------
 // Each tile is one GRID_SIZE x GRID_SIZE square, addressed by integer
-// (tileX, tileZ) - see buildGroundTile. TILE_CONTENT describes what beyond
-// the ground itself belongs in a given tile, keyed the same way loadTile
-// below looks it up. Phase 1 of the 40x40-tile roadmap: this is still a
-// fixed, hand-authored set (matching today's 2-tile world exactly, nothing
-// streams in/out at runtime), but it's the hook a later phase's procedural
-// per-tile content generation replaces this with. Paddies and the farmer
-// walkers stay outside this system for now - they're tightly coupled to
-// the walk-animation code further below and aren't part of the "does the
-// ground scale" question this tile system exists to answer.
+// (tileX, tileZ) - see buildGroundTile. getTileContent describes what
+// beyond the ground itself belongs in a given tile. TILE_CONTENT holds the
+// two hand-authored exceptions - (0,0) has the paddies (built entirely
+// outside this system, see the note below) and nothing else; (0,1) has the
+// two original houses, unchanged. Every other tile on the road column
+// (tileX === 0) gets a procedurally-decided pair of house sites, reusing
+// the exact flanking pattern HOUSE_PLACEMENTS already established (x = ∓3,
+// facing the road) - each side rolled independently and seeded by tile
+// position, so the result is deterministic and stable across reloads
+// without needing to store anything.
+//
+// Paddies and the farmer walkers still stay outside this system entirely:
+// they're tightly coupled to the walk-animation code further below (fixed
+// lanes, row lists, a hardcoded walk range), and generating new paddies
+// procedurally would mean spawning new walker instances too - a bigger
+// step than "what belongs in this tile", left for later.
 function tileKey(tileX, tileZ) {
   return `${tileX},${tileZ}`;
 }
 const TILE_CONTENT = {
+  [tileKey(0, 0)]: {},
   [tileKey(0, 1)]: { houses: HOUSE_PLACEMENTS },
 };
+const PROCEDURAL_HOUSE_CHANCE = 0.5; // per side, per eligible tile
+function getTileContent(tileX, tileZ) {
+  const key = tileKey(tileX, tileZ);
+  if (TILE_CONTENT[key]) return TILE_CONTENT[key];
+  if (tileX !== 0) return {}; // only the road column has content so far
+  const houses = [];
+  for (const side of [-1, 1]) {
+    const houseRoll = hash(tileZ * 4.7 + side * 12.9, tileZ * 9.3 - side * 3.1);
+    if (houseRoll > 1 - PROCEDURAL_HOUSE_CHANCE) {
+      const worn = hash(tileZ * 6.1 + side * 2.3, tileZ * 1.7 - side * 8.4) > 0.5;
+      houses.push({ x: side * 3, z: tileZ * GRID_SIZE, rotY: side < 0 ? Math.PI / 2 : -Math.PI / 2, worn });
+    }
+  }
+  return houses.length ? { houses } : {};
+}
 
 // The scene's ground is one continuous mesh, so a paddy sitting "in" it
 // needs its own vertices pushed down first — otherwise the ground plane at
@@ -172,7 +198,7 @@ function terrainRoll(worldX, worldZ, pathT) {
 // count. renderer and groundOpts (the soil/path/paddy config the bake
 // needs) are passed in rather than imported, keeping this function - and
 // groundMaterial.js - decoupled from this file's specific constants.
-function buildGroundTile(tileX, tileZ, renderer, groundOpts) {
+function buildGroundTile(tileX, tileZ, renderer, groundOpts, tileHouses) {
   const worldW = GRID_SIZE;
   const worldD = GRID_SIZE;
   const xCenter = tileX * GRID_SIZE;
@@ -193,7 +219,7 @@ function buildGroundTile(tileX, tileZ, renderer, groundOpts) {
     const worldZ = -pos.getY(i) + zCenter;
     const s = groundSample(worldX, worldZ);
     const roll = terrainRoll(worldX, worldZ, s.pathT);
-    const flatten = houseFlatten(worldX, worldZ);
+    const flatten = houseFlatten(worldX, worldZ, tileHouses);
     const rolled = (s.height + roll) * (1 - flatten);
     const depress = paddyDepression(worldX, worldZ);
     const finalHeight = rolled * (1 - depress) + PADDY_DEPRESS_Y * depress;
@@ -719,9 +745,12 @@ export default function VillagePathWalkScene() {
     const panRight = new THREE.Vector3(basisRight.x, 0, basisRight.z).normalize();
     const panFwd = new THREE.Vector3(basisUp.x, 0, basisUp.z).normalize(); // ground projection of "screen up"
     const panOffset = new THREE.Vector3(0, 0, 0);
-    const PAN_LIMIT_X = GRID_SIZE / 2 + 1;
+    const PAN_LIMIT_X = GRID_SIZE / 2 + 1; // still just the one-tile-wide road column
+    // Widened to cover the loaded tileZ range (0..2, see loadTile calls
+    // below): south edge of tile (0,0) is -7, north edge of tile (0,2) is
+    // 35, each with a 1-unit margin.
     const PAN_Z_MIN = -(GRID_SIZE / 2 + 1);
-    const PAN_Z_MAX = GRID_SIZE + GRID_SIZE / 2 + 1; // the road-only tile appended to the north
+    const PAN_Z_MAX = GRID_SIZE * 2 + GRID_SIZE / 2 + 1;
     function applyCameraTransform() {
       camera.position.copy(CAM_BASE_POS).add(panOffset);
       camera.lookAt(CAM_BASE_TARGET.clone().add(panOffset));
@@ -783,14 +812,16 @@ export default function VillagePathWalkScene() {
       const materials = [];
       const renderTargets = [];
 
-      const { mesh: groundMesh, renderTargets: groundTargets } = buildGroundTile(tileX, tileZ, renderer, groundOpts);
+      const content = getTileContent(tileX, tileZ);
+      const { mesh: groundMesh, renderTargets: groundTargets } = buildGroundTile(
+        tileX, tileZ, renderer, groundOpts, content.houses || []
+      );
       group.add(groundMesh);
       geometries.push(groundMesh.geometry);
       materials.push(groundMesh.material);
       renderTargets.push(...groundTargets);
 
-      const content = TILE_CONTENT[key];
-      if (content?.houses) {
+      if (content.houses) {
         for (const h of content.houses) {
           const house = h.worn ? buildFarmhouseVoxelWorn() : buildFarmhouseVoxel();
           house.position.set(h.x, 0, h.z);
@@ -817,12 +848,23 @@ export default function VillagePathWalkScene() {
       loadedTiles.delete(key);
     }
 
-    // Fixed for now, matching the current world exactly: (0,0) is the
-    // original tile (paddies, farmer walk range, z in [-7,7]); (0,1) is
-    // the road-only tile appended north of it (z in [7,21]), holding the
-    // two houses.
-    loadTile(0, 0);
-    loadTile(0, 1);
+    // Fixed for now (still no camera-driven streaming - that's a later
+    // phase): (0,0) is the original tile (paddies, farmer walk range, z in
+    // [-7,7]); (0,1) is the road-only tile north of it (z in [7,21]),
+    // holding the two hand-placed houses. (0,2) extends the village one
+    // tile further along the same road column, getting whatever
+    // getTileContent procedurally decided for it - a working demonstration
+    // that tiles beyond the two hand-authored ones aren't just empty
+    // ground. Kept to one extra tile rather than several: this dev
+    // sandbox's software (non-GPU) renderer got measurably less stable
+    // under sustained pan interaction as more tiles' worth of shadow-cast
+    // geometry piled up - a property of this environment's renderer, not
+    // of the tile system itself (loadTile/unloadTile have no per-call
+    // cost that scales with how many tiles came before). The real fix is
+    // Phase 4's streaming (only ever a handful of tiles active near the
+    // camera, however large the addressable world is) rather than
+    // widening this fixed list further.
+    for (let tileZ = 0; tileZ <= 2; tileZ++) loadTile(0, tileZ);
 
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).

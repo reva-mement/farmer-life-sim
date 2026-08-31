@@ -679,7 +679,12 @@ function createWalker({
   };
 }
 
-const MIN_ZOOM = 0.1; // pinched all the way out still fits the whole 14x14 field, even on a narrow phone
+// Lowered from an earlier 0.1: at that zoom the frustum's world footprint
+// (top/bottom = d/zoom = 34 units) was far larger than the actual ground
+// (14x28), so pinching/scrolling all the way out mostly showed background
+// void around a small patch of ground. 0.3 keeps the whole ground roughly
+// filling the frame instead.
+const MIN_ZOOM = 0.3;
 const MAX_ZOOM = 3.2;
 
 export default function VillagePathWalkScene() {
@@ -688,6 +693,12 @@ export default function VillagePathWalkScene() {
   useEffect(() => {
     const mount = mountRef.current;
     const scene = new THREE.Scene();
+    // A warm haze tone instead of the page's near-black CSS background
+    // showing through - the isometric camera's diamond-shaped view never
+    // exactly fills a rectangular viewport, so some margin beyond the
+    // ground is unavoidable at wide zoom; this keeps that margin from
+    // reading as a broken void.
+    scene.background = new THREE.Color(0xcdb992);
 
     const width = mount.clientWidth;
     const height = mount.clientHeight;

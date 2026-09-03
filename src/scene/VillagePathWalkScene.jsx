@@ -701,8 +701,10 @@ function createWalker({
 // Hard safety floor only - the real zoom-out limit is computed per-window
 // (see computeMinZoom below), since how far you can zoom out before the
 // ground stops filling the screen depends on the window's aspect ratio,
-// not just a single fixed number.
-const ABSOLUTE_MIN_ZOOM = 0.1;
+// not just a single fixed number. Low enough to not bind before that
+// computed floor does - seeing the full ~40-tile-wide world at once needs
+// zooming out to roughly 0.02-0.03 depending on aspect.
+const ABSOLUTE_MIN_ZOOM = 0.005;
 const MAX_ZOOM = 3.2;
 
 export default function VillagePathWalkScene() {
@@ -721,8 +723,24 @@ export default function VillagePathWalkScene() {
     const width = mount.clientWidth;
     const height = mount.clientHeight;
     const d = 3.4;
+    // near/far were 0.1/100 until far-chunk LOD was added. This isometric
+    // camera's view axis isn't aligned with either world axis, so a ground
+    // point's *depth* (distance along the view direction, what near/far
+    // actually clip against) depends on which diagonal direction it sits
+    // relative to the camera - not just how far away it looks on screen.
+    // Ground extending in the same XZ direction as the camera's own
+    // CAM_BASE_POS-CAM_BASE_TARGET offset gets *closer* in depth terms the
+    // further out it goes (and goes negative well before 350 world units,
+    // i.e. well inside FAR_MARGIN's coverage), while the opposite
+    // direction gets farther. So both planes need headroom: far=1000 to
+    // not clip the far side, and a deeply negative near (orthographic
+    // cameras allow this, unlike perspective) so the near side isn't
+    // clipped either - it was silently cutting out roughly half the
+    // loaded far chunks before this. Depth mapping is linear for an
+    // orthographic camera, so this wide a range costs no meaningful
+    // z-buffer precision here.
     const camera = new THREE.OrthographicCamera(
-      (-d * width) / height, (d * width) / height, d, -d, 0.1, 100
+      (-d * width) / height, (d * width) / height, d, -d, -1000, 1000
     );
     const CAM_BASE_POS = new THREE.Vector3(5.2, 5.2, 5.2);
     const CAM_BASE_TARGET = new THREE.Vector3(0, 0.3, 0);
@@ -764,6 +782,17 @@ export default function VillagePathWalkScene() {
     const WORLD_X_MAX = WORLD_TILE_RADIUS * GRID_SIZE;
     const WORLD_Z_MIN = -WORLD_TILE_RADIUS * GRID_SIZE;
     const WORLD_Z_MAX = WORLD_TILE_RADIUS * GRID_SIZE;
+    // LOD "far chunks" (below, alongside loadTile/unloadTile): cheap, low-
+    // res, flat, house-less, shadowless ground covering a much bigger
+    // radius than the full-detail near tiles - individually baking full
+    // detail for a 40x40-tile area at once (~1600 tiles) would need on the
+    // order of 19GB of GPU texture memory, so full detail only ever covers
+    // STREAM_MARGIN; everything out to FAR_MARGIN gets this coarse
+    // fallback instead, which is what lets the camera actually zoom out
+    // far enough to see the full addressable world at a glance.
+    const FAR_CHUNK_TILES = 20; // each far chunk covers a 20x20 block of tiles
+    const FAR_CHUNK_SIZE = GRID_SIZE * FAR_CHUNK_TILES;
+    const FAR_MARGIN = WORLD_TILE_RADIUS * GRID_SIZE;
     const viewDir = CAM_BASE_TARGET.clone().sub(CAM_BASE_POS).normalize();
     function groundFootprint(zoom) {
       let xMin = Infinity, xMax = -Infinity, zMin = Infinity, zMax = -Infinity;
@@ -800,12 +829,14 @@ export default function VillagePathWalkScene() {
     // zoom value - it depends on the window shape too. Derive the zoom
     // floor from the actual footprint at whatever aspect the window
     // currently has, and never let zoom go below the point where the
-    // footprint would exceed STREAM_MARGIN on either axis - that keeps it
-    // consistent with what streaming actually guarantees stays loaded.
+    // footprint would exceed FAR_MARGIN on either axis - that's the
+    // full-world extent the (coarse) far chunks cover, so the camera can
+    // zoom out enough to see the whole ~40x40-tile world, backed by LOD
+    // rather than full-detail tiles at that scale.
     function computeMinZoom() {
       const fp1 = groundFootprint(1); // footprint at zoom=1 (footprint scales as 1/zoom from here)
-      const zoomForX = (fp1.xMax - fp1.xMin) / (2 * STREAM_MARGIN);
-      const zoomForZ = (fp1.zMax - fp1.zMin) / (2 * STREAM_MARGIN);
+      const zoomForX = (fp1.xMax - fp1.xMin) / (2 * FAR_MARGIN);
+      const zoomForZ = (fp1.zMax - fp1.zMin) / (2 * FAR_MARGIN);
       return Math.max(ABSOLUTE_MIN_ZOOM, zoomForX, zoomForZ);
     }
     let minZoom = computeMinZoom();
@@ -937,6 +968,74 @@ export default function VillagePathWalkScene() {
     }
     updateStreamedTiles();
 
+    // ---- far-chunk LOD (see FAR_CHUNK_SIZE/FAR_MARGIN above) ----
+    // Same load/unload/stream shape as tiles above, but each chunk covers
+    // a FAR_CHUNK_TILES x FAR_CHUNK_TILES block, flat (no per-vertex
+    // terrain sampling), low-res baked textures, no shadows, no houses -
+    // built once per chunk mostly by reusing bakeGroundTextures/
+    // buildGroundMaterial at a much coarser resolution and size than
+    // buildGroundTile uses. Positioned slightly below y=0 so it's simply
+    // hidden under whichever full-detail near tiles happen to overlap it,
+    // rather than needing to track which region each system owns.
+    const FAR_TEX_PER_UNIT = 2;
+    const loadedFarChunks = new Map();
+    function buildFarChunk(chunkX, chunkZ) {
+      const size = FAR_CHUNK_SIZE;
+      const xCenter = chunkX * size;
+      const zCenter = chunkZ * size;
+      const geo = new THREE.PlaneGeometry(size, size, 1, 1);
+      geo.rotateX(-Math.PI / 2);
+      const { colorTarget, roughTarget } = bakeGroundTextures(
+        renderer, Math.round(size * FAR_TEX_PER_UNIT), Math.round(size * FAR_TEX_PER_UNIT),
+        size, size, xCenter, zCenter, groundOpts
+      );
+      const mat = buildGroundMaterial(colorTarget, roughTarget);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(xCenter, -0.02, zCenter);
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      return { mesh, renderTargets: [colorTarget, roughTarget] };
+    }
+    function loadFarChunk(chunkX, chunkZ) {
+      const key = tileKey(chunkX, chunkZ);
+      if (loadedFarChunks.has(key)) return;
+      const { mesh, renderTargets } = buildFarChunk(chunkX, chunkZ);
+      scene.add(mesh);
+      loadedFarChunks.set(key, {
+        mesh, geometries: [mesh.geometry], materials: [mesh.material], renderTargets,
+      });
+    }
+    function unloadFarChunk(chunkX, chunkZ) {
+      const key = tileKey(chunkX, chunkZ);
+      const entry = loadedFarChunks.get(key);
+      if (!entry) return;
+      scene.remove(entry.mesh);
+      entry.geometries.forEach((g) => g.dispose());
+      entry.materials.forEach((m) => m.dispose());
+      entry.renderTargets.forEach((rt) => rt.dispose());
+      loadedFarChunks.delete(key);
+    }
+    function updateStreamedFarChunks() {
+      const minCX = Math.floor((panOffset.x - FAR_MARGIN) / FAR_CHUNK_SIZE);
+      const maxCX = Math.ceil((panOffset.x + FAR_MARGIN) / FAR_CHUNK_SIZE);
+      const minCZ = Math.floor((panOffset.z - FAR_MARGIN) / FAR_CHUNK_SIZE);
+      const maxCZ = Math.ceil((panOffset.z + FAR_MARGIN) / FAR_CHUNK_SIZE);
+      const wanted = new Set();
+      for (let cx = minCX; cx <= maxCX; cx++) {
+        for (let cz = minCZ; cz <= maxCZ; cz++) {
+          wanted.add(tileKey(cx, cz));
+          loadFarChunk(cx, cz);
+        }
+      }
+      for (const key of [...loadedFarChunks.keys()]) {
+        if (!wanted.has(key)) {
+          const [cx, cz] = key.split(",").map(Number);
+          unloadFarChunk(cx, cz);
+        }
+      }
+    }
+    updateStreamedFarChunks();
+
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).
     const paddies = PADDY_PLACEMENTS.map(({ x, z }) => {
@@ -1016,6 +1115,7 @@ export default function VillagePathWalkScene() {
       renderer.setSize(w, h);
       clampPanOffset();
       updateStreamedTiles();
+      updateStreamedFarChunks();
       applyCameraTransform();
     }
     const ro = new ResizeObserver(handleResize);
@@ -1032,6 +1132,7 @@ export default function VillagePathWalkScene() {
       // for the next drag.
       clampPanOffset();
       updateStreamedTiles();
+      updateStreamedFarChunks();
       applyCameraTransform();
     }
     function onWheel(e) {
@@ -1072,6 +1173,7 @@ export default function VillagePathWalkScene() {
         panOffset.add(delta);
         clampPanOffset();
         updateStreamedTiles();
+        updateStreamedFarChunks();
         applyCameraTransform();
       }
     }

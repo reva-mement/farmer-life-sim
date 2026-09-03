@@ -198,12 +198,22 @@ function terrainRoll(worldX, worldZ, pathT) {
 // count. renderer and groundOpts (the soil/path/paddy config the bake
 // needs) are passed in rather than imported, keeping this function - and
 // groundMaterial.js - decoupled from this file's specific constants.
+// segs/texPerUnit are deliberately modest (were 88/75) rather than as
+// crisp as possible up close: every tile in the addressable world uses
+// this same setting uniformly - up to ~1600 of them can be loaded at once
+// once the camera is zoomed out far enough to see the whole world - so
+// the per-tile cost has to stay low enough to support that worst case,
+// not just look good for the handful of tiles near the camera. One
+// consistent (if modest) look everywhere beats sharp nearby tiles next to
+// blurry/simplified distant ones.
+const GROUND_SEGS = 8;
+const GROUND_TEX_PER_UNIT = 10;
 function buildGroundTile(tileX, tileZ, renderer, groundOpts, tileHouses) {
   const worldW = GRID_SIZE;
   const worldD = GRID_SIZE;
   const xCenter = tileX * GRID_SIZE;
   const zCenter = tileZ * GRID_SIZE;
-  const segs = 88;
+  const segs = GROUND_SEGS;
   const geo = new THREE.PlaneGeometry(worldW, worldD, segs, segs);
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
@@ -227,7 +237,7 @@ function buildGroundTile(tileX, tileZ, renderer, groundOpts, tileHouses) {
   }
   geo.computeVertexNormals();
   geo.rotateX(-Math.PI / 2);
-  const texPerUnit = 75;
+  const texPerUnit = GROUND_TEX_PER_UNIT;
   const { colorTarget, roughTarget } = bakeGroundTextures(
     renderer, Math.round(worldW * texPerUnit), Math.round(worldD * texPerUnit),
     worldW, worldD, xCenter, zCenter, groundOpts
@@ -235,8 +245,9 @@ function buildGroundTile(tileX, tileZ, renderer, groundOpts, tileHouses) {
   const mat = buildGroundMaterial(colorTarget, roughTarget);
   const mesh = new THREE.Mesh(geo, mat);
   mesh.position.set(xCenter, 0, zCenter);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
+  // No shadows - see the renderer.shadowMap note above.
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
   return { mesh, renderTargets: [colorTarget, roughTarget] };
 }
 
@@ -723,21 +734,21 @@ export default function VillagePathWalkScene() {
     const width = mount.clientWidth;
     const height = mount.clientHeight;
     const d = 3.4;
-    // near/far were 0.1/100 until far-chunk LOD was added. This isometric
-    // camera's view axis isn't aligned with either world axis, so a ground
-    // point's *depth* (distance along the view direction, what near/far
-    // actually clip against) depends on which diagonal direction it sits
-    // relative to the camera - not just how far away it looks on screen.
-    // Ground extending in the same XZ direction as the camera's own
-    // CAM_BASE_POS-CAM_BASE_TARGET offset gets *closer* in depth terms the
-    // further out it goes (and goes negative well before 350 world units,
-    // i.e. well inside FAR_MARGIN's coverage), while the opposite
-    // direction gets farther. So both planes need headroom: far=1000 to
-    // not clip the far side, and a deeply negative near (orthographic
-    // cameras allow this, unlike perspective) so the near side isn't
-    // clipped either - it was silently cutting out roughly half the
-    // loaded far chunks before this. Depth mapping is linear for an
-    // orthographic camera, so this wide a range costs no meaningful
+    // near/far were 0.1/100 until streaming grew to cover the whole world.
+    // This isometric camera's view axis isn't aligned with either world
+    // axis, so a ground point's *depth* (distance along the view
+    // direction, what near/far actually clip against) depends on which
+    // diagonal direction it sits relative to the camera - not just how far
+    // away it looks on screen. Ground extending in the same XZ direction
+    // as the camera's own CAM_BASE_POS-CAM_BASE_TARGET offset gets
+    // *closer* in depth terms the further out it goes (and goes negative
+    // well before 350 world units, i.e. well inside the loaded world's
+    // coverage), while the opposite direction gets farther. So both planes
+    // need headroom: far=1000 to not clip the far side, and a deeply
+    // negative near (orthographic cameras allow this, unlike perspective)
+    // so the near side isn't clipped either - it was silently cutting out
+    // roughly half the loaded world before this. Depth mapping is linear
+    // for an orthographic camera, so this wide a range costs no meaningful
     // z-buffer precision here.
     const camera = new THREE.OrthographicCamera(
       (-d * width) / height, (d * width) / height, d, -d, -1000, 1000
@@ -762,37 +773,42 @@ export default function VillagePathWalkScene() {
     const panRight = new THREE.Vector3(basisRight.x, 0, basisRight.z).normalize();
     const panFwd = new THREE.Vector3(basisUp.x, 0, basisUp.z).normalize(); // ground projection of "screen up"
     const panOffset = new THREE.Vector3(0, 0, 0);
-    // Phase 4: instead of a fixed list of loaded tiles, keep a margin of
-    // STREAM_MARGIN world units loaded around wherever panOffset currently
-    // is (see updateStreamedTiles, defined once loadTile/unloadTile exist
-    // below), and re-run that on every pan change. Ground coverage near
-    // the camera is then guaranteed continuously rather than tied to a
-    // fixed set of tiles, so the addressable world can be arbitrarily
-    // large while only ever a handful of tiles are actually loaded.
-    // STREAM_MARGIN sets both how far out the camera can zoom (see
-    // computeMinZoom - the frustum footprint must fit inside it) and how
-    // large a tile window streaming keeps loaded around the camera.
-    const STREAM_MARGIN = GRID_SIZE * 1.5;
-    // The addressable world is still finite - a generous edge (matching
-    // the ~40-tile-wide ideal from the original scoping discussion) so
-    // panning can't wander forever generating tiles, without constraining
-    // normal play anywhere near it.
-    const WORLD_TILE_RADIUS = 20;
-    const WORLD_X_MIN = -WORLD_TILE_RADIUS * GRID_SIZE;
-    const WORLD_X_MAX = WORLD_TILE_RADIUS * GRID_SIZE;
-    const WORLD_Z_MIN = -WORLD_TILE_RADIUS * GRID_SIZE;
-    const WORLD_Z_MAX = WORLD_TILE_RADIUS * GRID_SIZE;
-    // LOD "far chunks" (below, alongside loadTile/unloadTile): cheap, low-
-    // res, flat, house-less, shadowless ground covering a much bigger
-    // radius than the full-detail near tiles - individually baking full
-    // detail for a 40x40-tile area at once (~1600 tiles) would need on the
-    // order of 19GB of GPU texture memory, so full detail only ever covers
-    // STREAM_MARGIN; everything out to FAR_MARGIN gets this coarse
-    // fallback instead, which is what lets the camera actually zoom out
-    // far enough to see the full addressable world at a glance.
-    const FAR_CHUNK_TILES = 20; // each far chunk covers a 20x20 block of tiles
-    const FAR_CHUNK_SIZE = GRID_SIZE * FAR_CHUNK_TILES;
-    const FAR_MARGIN = WORLD_TILE_RADIUS * GRID_SIZE;
+    // Instead of a fixed list of loaded tiles, keep a margin loaded around
+    // wherever panOffset currently is (see updateStreamedTiles, defined
+    // once loadTile/unloadTile exist below), and re-run that on every pan
+    // *and* zoom change. Ground coverage near the camera is then
+    // guaranteed continuously rather than tied to a fixed set of tiles,
+    // so the addressable world can be arbitrarily large while only ever a
+    // bounded set of tiles are actually loaded.
+    //
+    // This used to be two tiers - full-detail tiles out to a small radius,
+    // plus much cheaper flattened/low-res "far chunks" further out so the
+    // camera could zoom out to see the whole world without baking full
+    // detail for ~1600 tiles at once (~19GB of GPU texture memory). That
+    // worked, but produced a visible quality seam wherever both were on
+    // screen together - by design (asked for explicitly): one uniform
+    // level of detail everywhere, chosen cheap enough to legitimately
+    // cover the *entire* addressable world (see buildGroundTile's reduced
+    // segs/texPerUnit and the disabled shadows below), rather than two
+    // tiers that only look consistent at the extremes.
+    //
+    // Uniform quality made "always keep the whole world loaded" briefly
+    // seem like the natural next step (drop the margin concept, load
+    // everything within WORLD_TILE_RADIUS unconditionally) - that doesn't
+    // work either: even individually-cheap tiles still cost a bake pass
+    // each, and baking on the order of 1600 tiles synchronously on every
+    // load turned the page unusably slow, even fully zoomed in where
+    // almost none of them are visible. currentStreamMargin() below is the
+    // fix: the loaded margin tracks the *current* frustum footprint (small
+    // when zoomed in, growing as the camera zooms out), capped at the
+    // world's edge - so tile count actually scales with how much ground
+    // is on screen, the same way it always should have.
+    const WORLD_TILE_RADIUS = 20; // generous edge matching the ~40-tile-wide ideal from the original scoping discussion
+    const WORLD_MARGIN = WORLD_TILE_RADIUS * GRID_SIZE;
+    const WORLD_X_MIN = -WORLD_MARGIN;
+    const WORLD_X_MAX = WORLD_MARGIN;
+    const WORLD_Z_MIN = -WORLD_MARGIN;
+    const WORLD_Z_MAX = WORLD_MARGIN;
     const viewDir = CAM_BASE_TARGET.clone().sub(CAM_BASE_POS).normalize();
     function groundFootprint(zoom) {
       let xMin = Infinity, xMax = -Infinity, zMin = Infinity, zMax = -Infinity;
@@ -809,11 +825,22 @@ export default function VillagePathWalkScene() {
       }
       return { xMin, xMax, zMin, zMax };
     }
+    // How far out tiles need to be kept loaded at the *current* zoom: half
+    // the frustum footprint's larger axis, plus one tile of buffer so a
+    // small pan doesn't immediately need a not-yet-loaded tile, capped at
+    // the world's edge (matches computeMinZoom's guarantee exactly at
+    // minZoom, and stays small at normal play zoom).
+    function currentStreamMargin() {
+      const fp = groundFootprint(camera.zoom);
+      const half = Math.max(fp.xMax - fp.xMin, fp.zMax - fp.zMin) / 2;
+      return Math.min(WORLD_MARGIN, half + GRID_SIZE);
+    }
     // The frustum-vs-ground containment concern from the previous fixed-
-    // tile-range design is now handled by streaming (it keeps STREAM_MARGIN
-    // loaded around the camera at all times) plus computeMinZoom (it never
-    // lets the frustum exceed STREAM_MARGIN) - so panOffset only needs
-    // clamping to the outer world edge, a plain min/max.
+    // tile-range design is now handled by streaming (it keeps at least
+    // the current footprint loaded around the camera at all times) plus
+    // computeMinZoom (it never lets the frustum exceed WORLD_MARGIN) - so
+    // panOffset only needs clamping to the outer world edge, a plain
+    // min/max.
     function clampPanOffset() {
       panOffset.x = Math.max(WORLD_X_MIN, Math.min(WORLD_X_MAX, panOffset.x));
       panOffset.z = Math.max(WORLD_Z_MIN, Math.min(WORLD_Z_MAX, panOffset.z));
@@ -829,14 +856,14 @@ export default function VillagePathWalkScene() {
     // zoom value - it depends on the window shape too. Derive the zoom
     // floor from the actual footprint at whatever aspect the window
     // currently has, and never let zoom go below the point where the
-    // footprint would exceed FAR_MARGIN on either axis - that's the
-    // full-world extent the (coarse) far chunks cover, so the camera can
-    // zoom out enough to see the whole ~40x40-tile world, backed by LOD
-    // rather than full-detail tiles at that scale.
+    // footprint would exceed WORLD_MARGIN (the world's edge) on either
+    // axis - this lets the camera zoom out enough to see the whole
+    // ~40x40-tile world at once, all of it kept at the one uniform
+    // (deliberately cheap) level of detail buildGroundTile uses.
     function computeMinZoom() {
       const fp1 = groundFootprint(1); // footprint at zoom=1 (footprint scales as 1/zoom from here)
-      const zoomForX = (fp1.xMax - fp1.xMin) / (2 * FAR_MARGIN);
-      const zoomForZ = (fp1.zMax - fp1.zMin) / (2 * FAR_MARGIN);
+      const zoomForX = (fp1.xMax - fp1.xMin) / (2 * WORLD_MARGIN);
+      const zoomForZ = (fp1.zMax - fp1.zMin) / (2 * WORLD_MARGIN);
       return Math.max(ABSOLUTE_MIN_ZOOM, zoomForX, zoomForZ);
     }
     let minZoom = computeMinZoom();
@@ -848,8 +875,15 @@ export default function VillagePathWalkScene() {
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Shadows were only ever correct within the directional light's small
+    // fixed shadow-camera frustum (+-5.8 units, sized for the original
+    // two-tile village) - once the world started streaming far beyond
+    // that, most tiles/houses silently never got a shadow at all, which
+    // was already an inconsistency, just a less visible one. Now that the
+    // whole world is meant to look uniform at a glance, drop shadows
+    // entirely rather than have them keep working only near the origin -
+    // see buildGroundTile and loadTile below, which no longer set
+    // castShadow/receiveShadow on anything.
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.0;
     renderer.outputEncoding = THREE.sRGBEncoding;
@@ -859,18 +893,6 @@ export default function VillagePathWalkScene() {
     scene.add(hemi);
     const sun = new THREE.DirectionalLight(0xffd9a0, 1.2);
     sun.position.set(6, 10, 4);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
-    // covers the ground itself, for its own gentle terrain relief —
-    // no longer needs to track the character, which no longer casts shadow
-    sun.shadow.camera.left = -5.8;
-    sun.shadow.camera.right = 5.8;
-    sun.shadow.camera.top = 5.8;
-    sun.shadow.camera.bottom = -5.8;
-    sun.shadow.camera.near = 1;
-    sun.shadow.camera.far = 24;
-    sun.shadow.bias = -0.0018;
-    sun.shadow.normalBias = 0.02;
     scene.add(sun);
     const fill = new THREE.AmbientLight(0x7d8caa, 0.18);
     scene.add(fill);
@@ -918,6 +940,13 @@ export default function VillagePathWalkScene() {
           house.traverse((obj) => {
             if (obj.geometry) geometries.push(obj.geometry);
             if (obj.material) materials.push(obj.material);
+            // House builders set these true internally, but with no
+            // shadow map (see renderer.shadowMap note above) that only
+            // ever did anything for houses within the light's small fixed
+            // shadow-camera frustum - override here rather than in the
+            // shared builders, which other scenes may still want it on.
+            obj.castShadow = false;
+            obj.receiveShadow = false;
           });
         }
       }
@@ -936,22 +965,22 @@ export default function VillagePathWalkScene() {
       loadedTiles.delete(key);
     }
 
-    // Keep every tile that could be needed to cover STREAM_MARGIN world
-    // units around the camera's current ground position loaded, and drop
-    // everything else. floor/ceil guarantee the loaded window fully
-    // covers [panOffset - STREAM_MARGIN, panOffset + STREAM_MARGIN] on
-    // each axis regardless of where panOffset falls relative to the tile
-    // grid, so this stays consistent with what computeMinZoom assumes is
-    // always available. tileX=0 is the hand-authored road column - (0,0)
-    // has the paddies/farmer-walk range, (0,1) the two hand-placed houses,
-    // further tiles (any tileX, any tileZ) get whatever getTileContent
-    // procedurally decides (empty ground off the road column, per its
-    // tileX!==0 case).
+    // Keep every tile that could be needed to cover the current zoom's
+    // margin (see currentStreamMargin above) around the camera's current
+    // ground position loaded, and drop everything else. floor/ceil
+    // guarantee the loaded window fully covers [panOffset - margin,
+    // panOffset + margin] on each axis regardless of where panOffset
+    // falls relative to the tile grid. tileX=0 is the hand-authored road
+    // column - (0,0) has the paddies/farmer-walk range, (0,1) the two
+    // hand-placed houses, further tiles (any tileX, any tileZ) get
+    // whatever getTileContent procedurally decides (empty ground off the
+    // road column, per its tileX!==0 case).
     function updateStreamedTiles() {
-      const minTileX = Math.floor((panOffset.x - STREAM_MARGIN) / GRID_SIZE);
-      const maxTileX = Math.ceil((panOffset.x + STREAM_MARGIN) / GRID_SIZE);
-      const minTileZ = Math.floor((panOffset.z - STREAM_MARGIN) / GRID_SIZE);
-      const maxTileZ = Math.ceil((panOffset.z + STREAM_MARGIN) / GRID_SIZE);
+      const margin = currentStreamMargin();
+      const minTileX = Math.floor((panOffset.x - margin) / GRID_SIZE);
+      const maxTileX = Math.ceil((panOffset.x + margin) / GRID_SIZE);
+      const minTileZ = Math.floor((panOffset.z - margin) / GRID_SIZE);
+      const maxTileZ = Math.ceil((panOffset.z + margin) / GRID_SIZE);
       const wanted = new Set();
       for (let tx = minTileX; tx <= maxTileX; tx++) {
         for (let tz = minTileZ; tz <= maxTileZ; tz++) {
@@ -968,79 +997,16 @@ export default function VillagePathWalkScene() {
     }
     updateStreamedTiles();
 
-    // ---- far-chunk LOD (see FAR_CHUNK_SIZE/FAR_MARGIN above) ----
-    // Same load/unload/stream shape as tiles above, but each chunk covers
-    // a FAR_CHUNK_TILES x FAR_CHUNK_TILES block, flat (no per-vertex
-    // terrain sampling), low-res baked textures, no shadows, no houses -
-    // built once per chunk mostly by reusing bakeGroundTextures/
-    // buildGroundMaterial at a much coarser resolution and size than
-    // buildGroundTile uses. Positioned slightly below y=0 so it's simply
-    // hidden under whichever full-detail near tiles happen to overlap it,
-    // rather than needing to track which region each system owns.
-    const FAR_TEX_PER_UNIT = 2;
-    const loadedFarChunks = new Map();
-    function buildFarChunk(chunkX, chunkZ) {
-      const size = FAR_CHUNK_SIZE;
-      const xCenter = chunkX * size;
-      const zCenter = chunkZ * size;
-      const geo = new THREE.PlaneGeometry(size, size, 1, 1);
-      geo.rotateX(-Math.PI / 2);
-      const { colorTarget, roughTarget } = bakeGroundTextures(
-        renderer, Math.round(size * FAR_TEX_PER_UNIT), Math.round(size * FAR_TEX_PER_UNIT),
-        size, size, xCenter, zCenter, groundOpts
-      );
-      const mat = buildGroundMaterial(colorTarget, roughTarget);
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.set(xCenter, -0.02, zCenter);
-      mesh.castShadow = false;
-      mesh.receiveShadow = false;
-      return { mesh, renderTargets: [colorTarget, roughTarget] };
-    }
-    function loadFarChunk(chunkX, chunkZ) {
-      const key = tileKey(chunkX, chunkZ);
-      if (loadedFarChunks.has(key)) return;
-      const { mesh, renderTargets } = buildFarChunk(chunkX, chunkZ);
-      scene.add(mesh);
-      loadedFarChunks.set(key, {
-        mesh, geometries: [mesh.geometry], materials: [mesh.material], renderTargets,
-      });
-    }
-    function unloadFarChunk(chunkX, chunkZ) {
-      const key = tileKey(chunkX, chunkZ);
-      const entry = loadedFarChunks.get(key);
-      if (!entry) return;
-      scene.remove(entry.mesh);
-      entry.geometries.forEach((g) => g.dispose());
-      entry.materials.forEach((m) => m.dispose());
-      entry.renderTargets.forEach((rt) => rt.dispose());
-      loadedFarChunks.delete(key);
-    }
-    function updateStreamedFarChunks() {
-      const minCX = Math.floor((panOffset.x - FAR_MARGIN) / FAR_CHUNK_SIZE);
-      const maxCX = Math.ceil((panOffset.x + FAR_MARGIN) / FAR_CHUNK_SIZE);
-      const minCZ = Math.floor((panOffset.z - FAR_MARGIN) / FAR_CHUNK_SIZE);
-      const maxCZ = Math.ceil((panOffset.z + FAR_MARGIN) / FAR_CHUNK_SIZE);
-      const wanted = new Set();
-      for (let cx = minCX; cx <= maxCX; cx++) {
-        for (let cz = minCZ; cz <= maxCZ; cz++) {
-          wanted.add(tileKey(cx, cz));
-          loadFarChunk(cx, cz);
-        }
-      }
-      for (const key of [...loadedFarChunks.keys()]) {
-        if (!wanted.has(key)) {
-          const [cx, cz] = key.split(",").map(Number);
-          unloadFarChunk(cx, cz);
-        }
-      }
-    }
-    updateStreamedFarChunks();
-
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).
     const paddies = PADDY_PLACEMENTS.map(({ x, z }) => {
       const paddy = buildPaddy();
       paddy.root.position.set(x, 0, z);
+      // No shadows anywhere now - see the renderer.shadowMap note above.
+      paddy.root.traverse((obj) => {
+        obj.castShadow = false;
+        obj.receiveShadow = false;
+      });
       scene.add(paddy.root);
       return paddy;
     });
@@ -1115,7 +1081,6 @@ export default function VillagePathWalkScene() {
       renderer.setSize(w, h);
       clampPanOffset();
       updateStreamedTiles();
-      updateStreamedFarChunks();
       applyCameraTransform();
     }
     const ro = new ResizeObserver(handleResize);
@@ -1132,7 +1097,6 @@ export default function VillagePathWalkScene() {
       // for the next drag.
       clampPanOffset();
       updateStreamedTiles();
-      updateStreamedFarChunks();
       applyCameraTransform();
     }
     function onWheel(e) {
@@ -1173,7 +1137,6 @@ export default function VillagePathWalkScene() {
         panOffset.add(delta);
         clampPanOffset();
         updateStreamedTiles();
-        updateStreamedFarChunks();
         applyCameraTransform();
       }
     }

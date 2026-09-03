@@ -698,12 +698,11 @@ function createWalker({
   };
 }
 
-// Lowered from an earlier 0.1: at that zoom the frustum's world footprint
-// (top/bottom = d/zoom = 34 units) was far larger than the actual ground
-// (14x28), so pinching/scrolling all the way out mostly showed background
-// void around a small patch of ground. 0.3 keeps the whole ground roughly
-// filling the frame instead.
-const MIN_ZOOM = 0.3;
+// Hard safety floor only - the real zoom-out limit is computed per-window
+// (see computeMinZoom below), since how far you can zoom out before the
+// ground stops filling the screen depends on the window's aspect ratio,
+// not just a single fixed number.
+const ABSOLUTE_MIN_ZOOM = 0.1;
 const MAX_ZOOM = 3.2;
 
 export default function VillagePathWalkScene() {
@@ -802,6 +801,28 @@ export default function VillagePathWalkScene() {
     function applyCameraTransform() {
       camera.position.copy(CAM_BASE_POS).add(panOffset);
       camera.lookAt(CAM_BASE_TARGET.clone().add(panOffset));
+    }
+    // A fixed MIN_ZOOM (how far the user can zoom out) can only be correct
+    // for one specific window aspect ratio: the frustum footprint's world
+    // size scales with 1/zoom AND with aspect (wider window -> wider
+    // frustum), while the loaded ground's size is fixed. So "zoomed out
+    // enough to show background" isn't a single zoom value - it depends on
+    // the window shape too. Fix: derive the zoom floor from the actual
+    // footprint (same math as clampPanOffset above), at whatever aspect
+    // the window currently has, and never let zoom go below the point
+    // where the footprint would first exceed the loaded ground on either
+    // axis. That guarantees the ground fills the screen at every zoom
+    // level the user can actually reach, on any device.
+    function computeMinZoom() {
+      const fp1 = groundFootprint(1); // footprint at zoom=1 (footprint scales as 1/zoom from here)
+      const zoomForX = (fp1.xMax - fp1.xMin) / (GROUND_X_MAX - GROUND_X_MIN);
+      const zoomForZ = (fp1.zMax - fp1.zMin) / (GROUND_Z_MAX - GROUND_Z_MIN);
+      return Math.max(ABSOLUTE_MIN_ZOOM, zoomForX, zoomForZ);
+    }
+    let minZoom = computeMinZoom();
+    if (camera.zoom < minZoom) {
+      camera.zoom = minZoom;
+      camera.updateProjectionMatrix();
     }
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -983,6 +1004,12 @@ export default function VillagePathWalkScene() {
       camera.right = (d * w) / h;
       camera.top = d;
       camera.bottom = -d;
+      // Aspect ratio changed, so the zoom floor that keeps the ground
+      // filling the screen changed too - recompute it, and pull the
+      // current zoom back up to it if the window just got relatively
+      // wider/taller than before.
+      minZoom = computeMinZoom();
+      if (camera.zoom < minZoom) camera.zoom = minZoom;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
       clampPanOffset();
@@ -994,7 +1021,7 @@ export default function VillagePathWalkScene() {
     // ---- zoom: mouse wheel (desktop) + two-finger pinch (touch) ----
     // ---- pan: one-finger / mouse drag, front-back-left-right on the ground ----
     function setZoom(z) {
-      camera.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+      camera.zoom = Math.max(minZoom, Math.min(MAX_ZOOM, z));
       camera.updateProjectionMatrix();
       // Zooming out shrinks the valid pan range (see clampPanOffset above),
       // so a panOffset that was fine before this zoom change can now sit

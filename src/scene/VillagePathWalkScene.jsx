@@ -744,28 +744,26 @@ export default function VillagePathWalkScene() {
     const panRight = new THREE.Vector3(basisRight.x, 0, basisRight.z).normalize();
     const panFwd = new THREE.Vector3(basisUp.x, 0, basisUp.z).normalize(); // ground projection of "screen up"
     const panOffset = new THREE.Vector3(0, 0, 0);
-    // Pan bounds used to be fixed constants (loaded-ground edge + a 1-unit
-    // margin), which implicitly assumed panOffset tracks the visible edge.
-    // That's only true near zoom=1: this isometric camera's frustum
-    // footprint on the ground grows as 1/zoom, so at low zoom the visible
-    // area extends far past panOffset itself - at MIN_ZOOM the footprint's
-    // diagonal is nearly as wide as the whole loaded ground, so the old
-    // fixed clamp let the frustum overshoot the loaded tiles by 10+ units,
-    // showing a large background wedge instead of a small margin.
-    // Fix: derive the clamp from the camera's actual ground footprint at
-    // the current zoom (intersect the 4 frustum corners with the y=0
-    // plane). When the footprint is wider than the loaded ground on an
-    // axis - always true in X (the ground is only one tile wide) and true
-    // in Z at the very lowest zoom - lock that axis to center the ground
-    // in the frustum instead of letting it drift to one side.
-    const LOADED_TILE_X_MIN = -1;
-    const LOADED_TILE_X_MAX = 1; // keep in sync with the loadTile range below
-    const LOADED_TILE_Z_MIN = 0;
-    const LOADED_TILE_Z_MAX = 2; // keep in sync with the loadTile range below
-    const GROUND_X_MIN = LOADED_TILE_X_MIN * GRID_SIZE - GRID_SIZE / 2;
-    const GROUND_X_MAX = LOADED_TILE_X_MAX * GRID_SIZE + GRID_SIZE / 2;
-    const GROUND_Z_MIN = LOADED_TILE_Z_MIN * GRID_SIZE - GRID_SIZE / 2;
-    const GROUND_Z_MAX = LOADED_TILE_Z_MAX * GRID_SIZE + GRID_SIZE / 2;
+    // Phase 4: instead of a fixed list of loaded tiles, keep a margin of
+    // STREAM_MARGIN world units loaded around wherever panOffset currently
+    // is (see updateStreamedTiles, defined once loadTile/unloadTile exist
+    // below), and re-run that on every pan change. Ground coverage near
+    // the camera is then guaranteed continuously rather than tied to a
+    // fixed set of tiles, so the addressable world can be arbitrarily
+    // large while only ever a handful of tiles are actually loaded.
+    // STREAM_MARGIN sets both how far out the camera can zoom (see
+    // computeMinZoom - the frustum footprint must fit inside it) and how
+    // large a tile window streaming keeps loaded around the camera.
+    const STREAM_MARGIN = GRID_SIZE * 1.5;
+    // The addressable world is still finite - a generous edge (matching
+    // the ~40-tile-wide ideal from the original scoping discussion) so
+    // panning can't wander forever generating tiles, without constraining
+    // normal play anywhere near it.
+    const WORLD_TILE_RADIUS = 20;
+    const WORLD_X_MIN = -WORLD_TILE_RADIUS * GRID_SIZE;
+    const WORLD_X_MAX = WORLD_TILE_RADIUS * GRID_SIZE;
+    const WORLD_Z_MIN = -WORLD_TILE_RADIUS * GRID_SIZE;
+    const WORLD_Z_MAX = WORLD_TILE_RADIUS * GRID_SIZE;
     const viewDir = CAM_BASE_TARGET.clone().sub(CAM_BASE_POS).normalize();
     function groundFootprint(zoom) {
       let xMin = Infinity, xMax = -Infinity, zMin = Infinity, zMax = -Infinity;
@@ -782,23 +780,14 @@ export default function VillagePathWalkScene() {
       }
       return { xMin, xMax, zMin, zMax };
     }
-    function clampAxis(fpMin, fpMax, groundMin, groundMax) {
-      if (fpMax - fpMin >= groundMax - groundMin) {
-        const center = (groundMin + groundMax) / 2 - (fpMin + fpMax) / 2;
-        return [center, center];
-      }
-      return [groundMin - fpMin, groundMax - fpMax];
-    }
-    function computePanBounds(zoom) {
-      const fp = groundFootprint(zoom);
-      const [xMin, xMax] = clampAxis(fp.xMin, fp.xMax, GROUND_X_MIN, GROUND_X_MAX);
-      const [zMin, zMax] = clampAxis(fp.zMin, fp.zMax, GROUND_Z_MIN, GROUND_Z_MAX);
-      return { xMin, xMax, zMin, zMax };
-    }
+    // The frustum-vs-ground containment concern from the previous fixed-
+    // tile-range design is now handled by streaming (it keeps STREAM_MARGIN
+    // loaded around the camera at all times) plus computeMinZoom (it never
+    // lets the frustum exceed STREAM_MARGIN) - so panOffset only needs
+    // clamping to the outer world edge, a plain min/max.
     function clampPanOffset() {
-      const b = computePanBounds(camera.zoom);
-      panOffset.x = Math.max(b.xMin, Math.min(b.xMax, panOffset.x));
-      panOffset.z = Math.max(b.zMin, Math.min(b.zMax, panOffset.z));
+      panOffset.x = Math.max(WORLD_X_MIN, Math.min(WORLD_X_MAX, panOffset.x));
+      panOffset.z = Math.max(WORLD_Z_MIN, Math.min(WORLD_Z_MAX, panOffset.z));
     }
     function applyCameraTransform() {
       camera.position.copy(CAM_BASE_POS).add(panOffset);
@@ -807,18 +796,16 @@ export default function VillagePathWalkScene() {
     // A fixed MIN_ZOOM (how far the user can zoom out) can only be correct
     // for one specific window aspect ratio: the frustum footprint's world
     // size scales with 1/zoom AND with aspect (wider window -> wider
-    // frustum), while the loaded ground's size is fixed. So "zoomed out
-    // enough to show background" isn't a single zoom value - it depends on
-    // the window shape too. Fix: derive the zoom floor from the actual
-    // footprint (same math as clampPanOffset above), at whatever aspect
-    // the window currently has, and never let zoom go below the point
-    // where the footprint would first exceed the loaded ground on either
-    // axis. That guarantees the ground fills the screen at every zoom
-    // level the user can actually reach, on any device.
+    // frustum). So "zoomed out enough to show background" isn't a single
+    // zoom value - it depends on the window shape too. Derive the zoom
+    // floor from the actual footprint at whatever aspect the window
+    // currently has, and never let zoom go below the point where the
+    // footprint would exceed STREAM_MARGIN on either axis - that keeps it
+    // consistent with what streaming actually guarantees stays loaded.
     function computeMinZoom() {
       const fp1 = groundFootprint(1); // footprint at zoom=1 (footprint scales as 1/zoom from here)
-      const zoomForX = (fp1.xMax - fp1.xMin) / (GROUND_X_MAX - GROUND_X_MIN);
-      const zoomForZ = (fp1.zMax - fp1.zMin) / (GROUND_Z_MAX - GROUND_Z_MIN);
+      const zoomForX = (fp1.xMax - fp1.xMin) / (2 * STREAM_MARGIN);
+      const zoomForZ = (fp1.zMax - fp1.zMin) / (2 * STREAM_MARGIN);
       return Math.max(ABSOLUTE_MIN_ZOOM, zoomForX, zoomForZ);
     }
     let minZoom = computeMinZoom();
@@ -870,10 +857,9 @@ export default function VillagePathWalkScene() {
     // ---- tile load/unload (see TILE_CONTENT above) ----
     // loadedTiles tracks what's live so a tile can be torn down cleanly:
     // scene.remove() plus disposing every geometry/material/render-target
-    // it added. Phase 1 calls loadTile with a fixed list (right below) and
-    // never unloads - the plumbing is here so a later phase can drive both
-    // calls from the camera's position instead, without touching this
-    // function again.
+    // it added. Driven by updateStreamedTiles (below) from the camera's
+    // position, so the addressable world can be arbitrarily large while
+    // only ever a handful of tiles near the camera are actually loaded.
     const loadedTiles = new Map();
     function loadTile(tileX, tileZ) {
       const key = tileKey(tileX, tileZ);
@@ -919,29 +905,37 @@ export default function VillagePathWalkScene() {
       loadedTiles.delete(key);
     }
 
-    // Fixed for now (still no camera-driven streaming - that's a later
-    // phase): tileX=0 is the road column - (0,0) is the original tile
-    // (paddies, farmer walk range, z in [-7,7]), (0,1) is the road-only
-    // tile north of it holding the two hand-placed houses, (0,2) extends
-    // the village one tile further, getting whatever getTileContent
-    // procedurally decided for it. tileX=-1/1 are plain ground (no
-    // content, per getTileContent's tileX!==0 case) added purely to widen
-    // the loaded ground so MIN_ZOOM's floor (see computeMinZoom above)
-    // allows zooming out further - X was previously only one tile wide,
-    // the tightest constraint on how far out the camera could go.
-    // Kept to a 3x3 tile block rather than more: this dev sandbox's
-    // software (non-GPU) renderer got measurably less stable under
-    // sustained pan interaction as more tiles' worth of shadow-cast
-    // geometry piled up - a property of this environment's renderer, not
-    // of the tile system itself (loadTile/unloadTile have no per-call
-    // cost that scales with how many tiles came before), and the added
-    // tiles here are cheap (ground only, no houses). The real fix is
-    // Phase 4's streaming (only ever a handful of tiles active near the
-    // camera, however large the addressable world is) rather than
-    // widening this fixed list further.
-    for (let tileX = -1; tileX <= 1; tileX++) {
-      for (let tileZ = 0; tileZ <= 2; tileZ++) loadTile(tileX, tileZ);
+    // Keep every tile that could be needed to cover STREAM_MARGIN world
+    // units around the camera's current ground position loaded, and drop
+    // everything else. floor/ceil guarantee the loaded window fully
+    // covers [panOffset - STREAM_MARGIN, panOffset + STREAM_MARGIN] on
+    // each axis regardless of where panOffset falls relative to the tile
+    // grid, so this stays consistent with what computeMinZoom assumes is
+    // always available. tileX=0 is the hand-authored road column - (0,0)
+    // has the paddies/farmer-walk range, (0,1) the two hand-placed houses,
+    // further tiles (any tileX, any tileZ) get whatever getTileContent
+    // procedurally decides (empty ground off the road column, per its
+    // tileX!==0 case).
+    function updateStreamedTiles() {
+      const minTileX = Math.floor((panOffset.x - STREAM_MARGIN) / GRID_SIZE);
+      const maxTileX = Math.ceil((panOffset.x + STREAM_MARGIN) / GRID_SIZE);
+      const minTileZ = Math.floor((panOffset.z - STREAM_MARGIN) / GRID_SIZE);
+      const maxTileZ = Math.ceil((panOffset.z + STREAM_MARGIN) / GRID_SIZE);
+      const wanted = new Set();
+      for (let tx = minTileX; tx <= maxTileX; tx++) {
+        for (let tz = minTileZ; tz <= maxTileZ; tz++) {
+          wanted.add(tileKey(tx, tz));
+          loadTile(tx, tz);
+        }
+      }
+      for (const key of [...loadedTiles.keys()]) {
+        if (!wanted.has(key)) {
+          const [tx, tz] = key.split(",").map(Number);
+          unloadTile(tx, tz);
+        }
+      }
     }
+    updateStreamedTiles();
 
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).
@@ -1021,6 +1015,7 @@ export default function VillagePathWalkScene() {
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
       clampPanOffset();
+      updateStreamedTiles();
       applyCameraTransform();
     }
     const ro = new ResizeObserver(handleResize);
@@ -1036,6 +1031,7 @@ export default function VillagePathWalkScene() {
       // outside it - reclamp and re-apply immediately rather than waiting
       // for the next drag.
       clampPanOffset();
+      updateStreamedTiles();
       applyCameraTransform();
     }
     function onWheel(e) {
@@ -1075,6 +1071,7 @@ export default function VillagePathWalkScene() {
           .add(panFwd.clone().multiplyScalar(dyPixels * worldPerPixelY));
         panOffset.add(delta);
         clampPanOffset();
+        updateStreamedTiles();
         applyCameraTransform();
       }
     }

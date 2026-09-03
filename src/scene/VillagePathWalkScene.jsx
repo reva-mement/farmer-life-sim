@@ -758,10 +758,12 @@ export default function VillagePathWalkScene() {
     // axis - always true in X (the ground is only one tile wide) and true
     // in Z at the very lowest zoom - lock that axis to center the ground
     // in the frustum instead of letting it drift to one side.
+    const LOADED_TILE_X_MIN = -1;
+    const LOADED_TILE_X_MAX = 1; // keep in sync with the loadTile range below
     const LOADED_TILE_Z_MIN = 0;
     const LOADED_TILE_Z_MAX = 2; // keep in sync with the loadTile range below
-    const GROUND_X_MIN = -GRID_SIZE / 2;
-    const GROUND_X_MAX = GRID_SIZE / 2;
+    const GROUND_X_MIN = LOADED_TILE_X_MIN * GRID_SIZE - GRID_SIZE / 2;
+    const GROUND_X_MAX = LOADED_TILE_X_MAX * GRID_SIZE + GRID_SIZE / 2;
     const GROUND_Z_MIN = LOADED_TILE_Z_MIN * GRID_SIZE - GRID_SIZE / 2;
     const GROUND_Z_MAX = LOADED_TILE_Z_MAX * GRID_SIZE + GRID_SIZE / 2;
     const viewDir = CAM_BASE_TARGET.clone().sub(CAM_BASE_POS).normalize();
@@ -918,22 +920,28 @@ export default function VillagePathWalkScene() {
     }
 
     // Fixed for now (still no camera-driven streaming - that's a later
-    // phase): (0,0) is the original tile (paddies, farmer walk range, z in
-    // [-7,7]); (0,1) is the road-only tile north of it (z in [7,21]),
-    // holding the two hand-placed houses. (0,2) extends the village one
-    // tile further along the same road column, getting whatever
-    // getTileContent procedurally decided for it - a working demonstration
-    // that tiles beyond the two hand-authored ones aren't just empty
-    // ground. Kept to one extra tile rather than several: this dev
-    // sandbox's software (non-GPU) renderer got measurably less stable
-    // under sustained pan interaction as more tiles' worth of shadow-cast
+    // phase): tileX=0 is the road column - (0,0) is the original tile
+    // (paddies, farmer walk range, z in [-7,7]), (0,1) is the road-only
+    // tile north of it holding the two hand-placed houses, (0,2) extends
+    // the village one tile further, getting whatever getTileContent
+    // procedurally decided for it. tileX=-1/1 are plain ground (no
+    // content, per getTileContent's tileX!==0 case) added purely to widen
+    // the loaded ground so MIN_ZOOM's floor (see computeMinZoom above)
+    // allows zooming out further - X was previously only one tile wide,
+    // the tightest constraint on how far out the camera could go.
+    // Kept to a 3x3 tile block rather than more: this dev sandbox's
+    // software (non-GPU) renderer got measurably less stable under
+    // sustained pan interaction as more tiles' worth of shadow-cast
     // geometry piled up - a property of this environment's renderer, not
     // of the tile system itself (loadTile/unloadTile have no per-call
-    // cost that scales with how many tiles came before). The real fix is
+    // cost that scales with how many tiles came before), and the added
+    // tiles here are cheap (ground only, no houses). The real fix is
     // Phase 4's streaming (only ever a handful of tiles active near the
     // camera, however large the addressable world is) rather than
     // widening this fixed list further.
-    for (let tileZ = 0; tileZ <= 2; tileZ++) loadTile(0, tileZ);
+    for (let tileX = -1; tileX <= 1; tileX++) {
+      for (let tileZ = 0; tileZ <= 2; tileZ++) loadTile(tileX, tileZ);
+    }
 
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).

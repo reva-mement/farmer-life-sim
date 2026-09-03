@@ -745,12 +745,60 @@ export default function VillagePathWalkScene() {
     const panRight = new THREE.Vector3(basisRight.x, 0, basisRight.z).normalize();
     const panFwd = new THREE.Vector3(basisUp.x, 0, basisUp.z).normalize(); // ground projection of "screen up"
     const panOffset = new THREE.Vector3(0, 0, 0);
-    const PAN_LIMIT_X = GRID_SIZE / 2 + 1; // still just the one-tile-wide road column
-    // Widened to cover the loaded tileZ range (0..2, see loadTile calls
-    // below): south edge of tile (0,0) is -7, north edge of tile (0,2) is
-    // 35, each with a 1-unit margin.
-    const PAN_Z_MIN = -(GRID_SIZE / 2 + 1);
-    const PAN_Z_MAX = GRID_SIZE * 2 + GRID_SIZE / 2 + 1;
+    // Pan bounds used to be fixed constants (loaded-ground edge + a 1-unit
+    // margin), which implicitly assumed panOffset tracks the visible edge.
+    // That's only true near zoom=1: this isometric camera's frustum
+    // footprint on the ground grows as 1/zoom, so at low zoom the visible
+    // area extends far past panOffset itself - at MIN_ZOOM the footprint's
+    // diagonal is nearly as wide as the whole loaded ground, so the old
+    // fixed clamp let the frustum overshoot the loaded tiles by 10+ units,
+    // showing a large background wedge instead of a small margin.
+    // Fix: derive the clamp from the camera's actual ground footprint at
+    // the current zoom (intersect the 4 frustum corners with the y=0
+    // plane). When the footprint is wider than the loaded ground on an
+    // axis - always true in X (the ground is only one tile wide) and true
+    // in Z at the very lowest zoom - lock that axis to center the ground
+    // in the frustum instead of letting it drift to one side.
+    const LOADED_TILE_Z_MIN = 0;
+    const LOADED_TILE_Z_MAX = 2; // keep in sync with the loadTile range below
+    const GROUND_X_MIN = -GRID_SIZE / 2;
+    const GROUND_X_MAX = GRID_SIZE / 2;
+    const GROUND_Z_MIN = LOADED_TILE_Z_MIN * GRID_SIZE - GRID_SIZE / 2;
+    const GROUND_Z_MAX = LOADED_TILE_Z_MAX * GRID_SIZE + GRID_SIZE / 2;
+    const viewDir = CAM_BASE_TARGET.clone().sub(CAM_BASE_POS).normalize();
+    function groundFootprint(zoom) {
+      let xMin = Infinity, xMax = -Infinity, zMin = Infinity, zMax = -Infinity;
+      for (const u of [camera.left / zoom, camera.right / zoom]) {
+        for (const v of [camera.top / zoom, camera.bottom / zoom]) {
+          const pos = CAM_BASE_POS.clone()
+            .add(basisRight.clone().multiplyScalar(u))
+            .add(basisUp.clone().multiplyScalar(v));
+          const t = -pos.y / viewDir.y;
+          const p = pos.addScaledVector(viewDir, t);
+          xMin = Math.min(xMin, p.x); xMax = Math.max(xMax, p.x);
+          zMin = Math.min(zMin, p.z); zMax = Math.max(zMax, p.z);
+        }
+      }
+      return { xMin, xMax, zMin, zMax };
+    }
+    function clampAxis(fpMin, fpMax, groundMin, groundMax) {
+      if (fpMax - fpMin >= groundMax - groundMin) {
+        const center = (groundMin + groundMax) / 2 - (fpMin + fpMax) / 2;
+        return [center, center];
+      }
+      return [groundMin - fpMin, groundMax - fpMax];
+    }
+    function computePanBounds(zoom) {
+      const fp = groundFootprint(zoom);
+      const [xMin, xMax] = clampAxis(fp.xMin, fp.xMax, GROUND_X_MIN, GROUND_X_MAX);
+      const [zMin, zMax] = clampAxis(fp.zMin, fp.zMax, GROUND_Z_MIN, GROUND_Z_MAX);
+      return { xMin, xMax, zMin, zMax };
+    }
+    function clampPanOffset() {
+      const b = computePanBounds(camera.zoom);
+      panOffset.x = Math.max(b.xMin, Math.min(b.xMax, panOffset.x));
+      panOffset.z = Math.max(b.zMin, Math.min(b.zMax, panOffset.z));
+    }
     function applyCameraTransform() {
       camera.position.copy(CAM_BASE_POS).add(panOffset);
       camera.lookAt(CAM_BASE_TARGET.clone().add(panOffset));
@@ -937,6 +985,8 @@ export default function VillagePathWalkScene() {
       camera.bottom = -d;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      clampPanOffset();
+      applyCameraTransform();
     }
     const ro = new ResizeObserver(handleResize);
     ro.observe(mount);
@@ -946,6 +996,12 @@ export default function VillagePathWalkScene() {
     function setZoom(z) {
       camera.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
       camera.updateProjectionMatrix();
+      // Zooming out shrinks the valid pan range (see clampPanOffset above),
+      // so a panOffset that was fine before this zoom change can now sit
+      // outside it - reclamp and re-apply immediately rather than waiting
+      // for the next drag.
+      clampPanOffset();
+      applyCameraTransform();
     }
     function onWheel(e) {
       e.preventDefault();
@@ -983,8 +1039,7 @@ export default function VillagePathWalkScene() {
         const delta = panRight.clone().multiplyScalar(-dxPixels * worldPerPixelY)
           .add(panFwd.clone().multiplyScalar(dyPixels * worldPerPixelY));
         panOffset.add(delta);
-        panOffset.x = Math.max(-PAN_LIMIT_X, Math.min(PAN_LIMIT_X, panOffset.x));
-        panOffset.z = Math.max(PAN_Z_MIN, Math.min(PAN_Z_MAX, panOffset.z));
+        clampPanOffset();
         applyCameraTransform();
       }
     }

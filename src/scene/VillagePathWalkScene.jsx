@@ -1009,19 +1009,45 @@ export default function VillagePathWalkScene() {
       loadedChunks.delete(key);
     }
 
+    // Loading a chunk (bake + geometry build) is fast in isolation, but
+    // panning while zoomed way out can cross several chunk boundaries in
+    // one drag (the same screen-pixel drag covers more world distance the
+    // further zoomed out you are), wanting several new chunks at once - if
+    // updateStreamedChunks built all of them synchronously inside the
+    // pointermove handler, that's several bake passes blocking the main
+    // thread back to back, felt as a stutter mid-drag on real hardware
+    // (confirmed - not a sandbox artifact). pendingChunkLoads decouples
+    // "this chunk is wanted" from "this chunk is actually built": interactive
+    // calls only enqueue, and processPendingChunkLoads (called once per
+    // animate() frame) builds a small, bounded number of them each frame,
+    // spreading the cost out instead of doing it all at once. The initial
+    // load still builds synchronously (immediate=true) so the world isn't
+    // visibly empty for the first few frames.
+    const pendingChunkLoads = new Set();
+    const CHUNKS_PER_FRAME = 1;
+    function processPendingChunkLoads() {
+      let n = CHUNKS_PER_FRAME;
+      for (const key of pendingChunkLoads) {
+        if (n-- <= 0) break;
+        pendingChunkLoads.delete(key);
+        const [cx, cz] = key.split(",").map(Number);
+        loadChunk(cx, cz);
+      }
+    }
+
     // Keep every chunk that could be needed to cover the current zoom's
     // margin (see currentStreamMargin above) around the camera's current
-    // ground position loaded, and drop everything else. floor/ceil
-    // guarantee the loaded window fully covers [panOffset - margin,
-    // panOffset + margin] on each axis regardless of where panOffset
-    // falls relative to the chunk grid. tileX=0 is the hand-authored road
-    // column (see chunkTileRange/getChunkHouses above for how a chunk's
-    // houses are gathered from the tiles it spans) - (0,0) has the
-    // paddies/farmer-walk range, (0,1) the two hand-placed houses, further
-    // tiles (any tileX, any tileZ) get whatever getTileContent
-    // procedurally decides (empty ground off the road column, per its
-    // tileX!==0 case).
-    function updateStreamedChunks() {
+    // ground position loaded (or queued to load, see pendingChunkLoads),
+    // and drop everything else. floor/ceil guarantee the loaded window
+    // fully covers [panOffset - margin, panOffset + margin] on each axis
+    // regardless of where panOffset falls relative to the chunk grid.
+    // tileX=0 is the hand-authored road column (see chunkTileRange/
+    // getChunkHouses above for how a chunk's houses are gathered from the
+    // tiles it spans) - (0,0) has the paddies/farmer-walk range, (0,1) the
+    // two hand-placed houses, further tiles (any tileX, any tileZ) get
+    // whatever getTileContent procedurally decides (empty ground off the
+    // road column, per its tileX!==0 case).
+    function updateStreamedChunks(immediate = false) {
       const margin = currentStreamMargin();
       const minChunkX = Math.floor((panOffset.x - margin) / CHUNK_SIZE);
       const maxChunkX = Math.ceil((panOffset.x + margin) / CHUNK_SIZE);
@@ -1030,8 +1056,10 @@ export default function VillagePathWalkScene() {
       const wanted = new Set();
       for (let cx = minChunkX; cx <= maxChunkX; cx++) {
         for (let cz = minChunkZ; cz <= maxChunkZ; cz++) {
-          wanted.add(tileKey(cx, cz));
-          loadChunk(cx, cz);
+          const key = tileKey(cx, cz);
+          wanted.add(key);
+          if (immediate) loadChunk(cx, cz);
+          else if (!loadedChunks.has(key)) pendingChunkLoads.add(key);
         }
       }
       for (const key of [...loadedChunks.keys()]) {
@@ -1040,8 +1068,14 @@ export default function VillagePathWalkScene() {
           unloadChunk(cx, cz);
         }
       }
+      // A chunk that fell out of range before its turn came up would
+      // otherwise still get built (and immediately be wrong/unwanted) -
+      // drop anything no longer wanted from the queue too.
+      for (const key of [...pendingChunkLoads]) {
+        if (!wanted.has(key)) pendingChunkLoads.delete(key);
+      }
     }
-    updateStreamedChunks();
+    updateStreamedChunks(true);
 
     // Rice paddies flanking the path, one on each side, clear of both the
     // path's soft edge (|x| < 0.9) and the ground bounds (|x| < 7).
@@ -1106,6 +1140,7 @@ export default function VillagePathWalkScene() {
         if (water.material.map) water.material.map.offset.set(ox, oy);
         if (water.material.bumpMap) water.material.bumpMap.offset.set(ox * 1.3, oy * 1.3);
       }
+      processPendingChunkLoads();
       renderer.render(scene, camera);
     }
     renderer.setAnimationLoop(animate);
@@ -1126,7 +1161,11 @@ export default function VillagePathWalkScene() {
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
       clampPanOffset();
-      updateStreamedChunks();
+      // Resize is a rare, discrete event (not a continuous drag), so
+      // there's no stutter concern here the way there is for pan/zoom -
+      // load synchronously so the window isn't briefly missing chunks
+      // right after a resize.
+      updateStreamedChunks(true);
       applyCameraTransform();
     }
     const ro = new ResizeObserver(handleResize);

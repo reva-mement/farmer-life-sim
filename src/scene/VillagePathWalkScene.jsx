@@ -841,7 +841,14 @@ export default function VillagePathWalkScene() {
     // chunks that bake as a single pass cuts the worst-case bake count by
     // CHUNK_TILES^2 (~49x at CHUNK_TILES=7), without changing anything
     // about how the ground actually looks.
-    const WORLD_TILE_RADIUS = 20; // generous edge matching the ~40-tile-wide ideal from the original scoping discussion
+    // Halved from an earlier 20: quarters the worst-case chunk count/GPU
+    // memory at maximum zoom-out (halving a *radius* quarters the area),
+    // a real, direct saving even though it wasn't what fixed the
+    // still-unexplained screenshot-capture delay in this dev sandbox at
+    // that same extreme (that delay didn't track chunk count either, so
+    // it's most likely specific to the verification environment, not the
+    // page itself - see the batching commit's investigation).
+    const WORLD_TILE_RADIUS = 10; // ~20-tile-wide addressable world
     const WORLD_MARGIN = WORLD_TILE_RADIUS * GRID_SIZE;
     const WORLD_X_MIN = -WORLD_MARGIN;
     const WORLD_X_MAX = WORLD_MARGIN;
@@ -896,8 +903,9 @@ export default function VillagePathWalkScene() {
     // currently has, and never let zoom go below the point where the
     // footprint would exceed WORLD_MARGIN (the world's edge) on either
     // axis - this lets the camera zoom out enough to see the whole
-    // ~40x40-tile world at once, all of it kept at the one uniform
-    // (deliberately cheap) level of detail buildGroundChunk uses.
+    // addressable world (WORLD_TILE_RADIUS wide) at once, all of it kept
+    // at the one uniform (deliberately cheap) level of detail
+    // buildGroundChunk uses.
     function computeMinZoom() {
       const fp1 = groundFootprint(1); // footprint at zoom=1 (footprint scales as 1/zoom from here)
       const zoomForX = (fp1.xMax - fp1.xMin) / (2 * WORLD_MARGIN);
